@@ -31,7 +31,9 @@ _failures: dict[str, list[float]] = {}
 
 
 DEFAULT_WEB_USERNAME = "admin"
-DEFAULT_WEB_PASSWORD = "poly@4321"
+# No default password is shipped: the dashboard refuses login until
+# WEB_PASSWORD is explicitly configured (Coolify env / .env.docker).
+DEFAULT_WEB_PASSWORD = ""
 
 
 def web_username() -> str:
