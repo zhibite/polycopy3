@@ -11,6 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY polycopy ./polycopy
 COPY configs ./configs
 
-EXPOSE 8040
+EXPOSE 8041
 
 CMD ["python", "-m", "polycopy.web"]

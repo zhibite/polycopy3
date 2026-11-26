@@ -5,10 +5,10 @@ services:
 
     # Coolify/Traefik connects to the container network; no host port needed.
     expose:
-      - "8040"
+      - "8041"
 
     environment:
-      WEB_PORT: "8040"
+      WEB_PORT: "8041"
       WEB_USERNAME: "${WEB_USERNAME:-admin}"
       WEB_PASSWORD: "${WEB_PASSWORD:-}"
       WEB_SESSION_TTL_S: "${WEB_SESSION_TTL_S:-604800}"
@@ -25,7 +25,7 @@ services:
       - "${POLY_HOST_DIR:-/root/polycopy}:/app/project"
 
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8040/api/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8041/api/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
