@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import secrets
 import threading
 import time
@@ -23,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from ..api import ClobApi
-from ..config import AppConfig, RunConfig, load_config
+from ..config import AppConfig, RunConfig, TargetConfig, load_config
 from ..http import HttpClient
 from . import auth, config_io, queries
 
@@ -183,7 +184,29 @@ REASON_CN = {
     "no_position": "我方无仓位",
     "dust": "仓位过小",
     "no_fill": "未成交",
-    "sells_disabled": "未开启跟卖",
+    "order_pending": "订单待确认",
+    "exit_pending": "卖出重试中",
+    "expiry_unknown": "无法获取结算时间",
+    "expiry_too_close": "距结算不足 2 小时",
+    "maker_pending": "挂单等待成交",
+    "maker_canceled": "maker 挂单被撤销",
+    "maker_rejected": "maker 挂单被拒绝",
+    "cancel_failed": "撤单未确认",
+    "target_sold_before_fill": "目标卖出，撤销挂单",
+    "target_flat_before_tail": "目标已清仓，停止补单",
+    "fallback_no_fill": "FAK 补单未成交",
+    "tail_order_missing": "补单订单丢失",
+    "tail_timeout": "补单未确认",
+    "tail_expired": "挂单超时过久",
+    "bad_tail_cap": "补单价格无效",
+    "no_order": "挂单未创建",
+    "target_disabled": "目标已停用",
+    "market_closed": "市场已关闭",
+    "kill_switch": "Kill switch 已触发",
+    "daily_loss_limit": "触发日亏损上限",
+    "take_profit": "止盈",
+    "stop_loss": "止损",
+    "risk_exit": "风控退出",
 }
 
 
@@ -262,6 +285,10 @@ def _render(request: Request, name: str, page: str, **ctx: Any) -> HTMLResponse:
     actual_mode = db_mode or configured_mode
     dry_run = (db_dry == "1") if db_dry is not None else (
         cfg.live.dry_run if cfg else True)
+    target_names = (
+        {t.address.lower(): name for name, t in cfg.targets.items()}
+        if cfg else {}
+    )
     context = {
         "request": request,
         "page": page,
@@ -274,6 +301,7 @@ def _render(request: Request, name: str, page: str, **ctx: Any) -> HTMLResponse:
         "live_dry_run": dry_run,
         "config_mode": configured_mode,
         "mode_mismatch": bool(db_mode and db_mode != configured_mode),
+        "target_names": target_names,
         "min_sell_shares": (
             cfg.live.min_order_shares if actual_mode == "live"
             else cfg.paper.min_shares) if cfg else 1.0,
@@ -418,14 +446,15 @@ def trades(request: Request, side: str = "", fill_type: str = "",
 
 @app.get("/positions", response_class=HTMLResponse)
 def positions(request: Request, status: str = "open", page: int = 1,
-              sell_queued: str = "", sell_error: str = ""):
+              target: str = "", sell_queued: str = "", sell_error: str = ""):
     redirect = _login_redirect(request)
     if redirect:
         return redirect
     session = auth.current_session(request)
     conn = queries.connect()
     try:
-        data = queries.positions_page(conn, status=status, page=page, per_page=50)
+        data = queries.positions_page(
+            conn, status=status, page=page, per_page=50, target=target)
         settlements = queries.recent_settlements(conn, limit=15)
         queued_manual = queries.pending_manual_sells(conn, limit=20)
     finally:
@@ -462,27 +491,150 @@ def positions_sell(request: Request, position_id: int = Form(...),
 
 
 @app.get("/signals", response_class=HTMLResponse)
-def signals(request: Request, copied: str = "", reason: str = "", page: int = 1):
+def signals(request: Request, copied: str = "", reason: str = "",
+            target: str = "", page: int = 1):
     redirect = _login_redirect(request)
     if redirect:
         return redirect
     conn = queries.connect()
     try:
         data = queries.signals_page(
-            conn, copied=copied, reason=reason, page=page, per_page=20
+            conn, copied=copied, reason=reason, target=target,
+            page=page, per_page=20
         )
         summary = queries.signal_summary(conn)
     finally:
         queries.close(conn)
     return _render(
         request, "signals.html", "signals", data=data, summary=summary,
-        cfg=_load_cfg(), filters={"copied": copied, "reason": reason},
+        cfg=_load_cfg(),
+        filters={"copied": copied, "reason": reason, "target": target},
     )
 
 
+TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+TARGET_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+def _default_target(address: str = "") -> TargetConfig:
+    return TargetConfig(
+        address=address,
+        enabled=True,
+        sizing_mode="fixed",
+        fixed_notional_usd=10.0,
+        min_notional_usd=2.0,
+        max_notional_usd=500.0,
+        buy_price_min=0.30,
+        buy_price_max=0.70,
+        min_target_usd=1000.0,
+        max_market_usd=500.0,
+        max_open_positions=300,
+        min_hours_to_end=2.0,
+        maker_entry_enabled=True,
+        maker_timeout_seconds=300,
+        fak_max_premium_pct=0.02,
+        take_profit_pct=0.10,
+        stop_loss_pct=0.20,
+    )
+
+
+def _enabled_addresses(cfg: AppConfig) -> set[str]:
+    return {
+        t.address.lower() for t in cfg.targets.values() if t.enabled
+    }
+
+
+def _parse_target_form(form: Any, base: TargetConfig, *, is_new: bool,
+                       errors: list[str]) -> TargetConfig:
+    fee_raw = str(form.get("target.fee_rate", "")).strip()
+    fee_override: float | None = None
+    if fee_raw:
+        try:
+            fee_override = float(fee_raw)
+            if fee_override < 0 or fee_override > 0.5:
+                errors.append("目标手续费率必须在 0 到 0.5 之间")
+        except ValueError:
+            errors.append("目标手续费率不是有效数字")
+            fee_override = base.fee_rate
+    target = replace(
+        base,
+        enabled=_fbool(form, "target.enabled"),
+        sizing_mode=str(form.get("target.sizing_mode") or base.sizing_mode),
+        scale_factor=_fnum(form, "target.scale_factor", base.scale_factor,
+                           errors, "跟单比例", 0.00001, 1),
+        fixed_notional_usd=_fnum(
+            form, "target.fixed_notional_usd", base.fixed_notional_usd,
+            errors, "固定跟单金额", 0, 1_000_000),
+        min_notional_usd=_fnum(
+            form, "target.min_notional_usd", base.min_notional_usd,
+            errors, "单笔最小金额", 0, 1_000_000),
+        max_notional_usd=_fnum(
+            form, "target.max_notional_usd", base.max_notional_usd,
+            errors, "单笔最大金额", 0, 1_000_000),
+        buy_price_min=_fnum(
+            form, "target.buy_price_min", base.buy_price_min,
+            errors, "最低买入价", 0, 1),
+        buy_price_max=_fnum(
+            form, "target.buy_price_max", base.buy_price_max,
+            errors, "最高买入价", 0, 1),
+        min_target_usd=_fnum(
+            form, "target.min_target_usd", base.min_target_usd,
+            errors, "目标最小成交额", 0, 1e12),
+        max_target_usd=_fnum(
+            form, "target.max_target_usd", base.max_target_usd,
+            errors, "目标最大成交额", 0, 1e12),
+        copy_sells=_fbool(form, "target.copy_sells"),
+        initial_lookback_seconds=_fint(
+            form, "target.initial_lookback_seconds",
+            base.initial_lookback_seconds, errors, "首次回溯秒数", 0, 86400),
+        max_market_usd=_fnum(
+            form, "target.max_market_usd", base.max_market_usd,
+            errors, "单市场敞口", 0, 1e9),
+        max_open_positions=_fint(
+            form, "target.max_open_positions", base.max_open_positions,
+            errors, "最大持仓数", 1, 10000),
+        min_hours_to_end=_fnum(
+            form, "target.min_hours_to_end", base.min_hours_to_end,
+            errors, "距结算最少小时数", 0, 168),
+        maker_entry_enabled=_fbool(form, "target.maker_entry_enabled"),
+        maker_timeout_seconds=_fint(
+            form, "target.maker_timeout_seconds",
+            base.maker_timeout_seconds, errors, "maker 挂单超时", 1, 86400),
+        fak_max_premium_pct=_fnum(
+            form, "target.fak_max_premium_pct", base.fak_max_premium_pct,
+            errors, "FAK 补单最高溢价", 0, 0.5),
+        take_profit_pct=_fnum(
+            form, "target.take_profit_pct", base.take_profit_pct,
+            errors, "止盈比例", 0, 1),
+        stop_loss_pct=_fnum(
+            form, "target.stop_loss_pct", base.stop_loss_pct,
+            errors, "止损比例", 0, 1),
+        fee_rate=fee_override,
+        exclude_event_substrings=_flist(
+            form, "target.exclude_event_substrings"),
+        exclude_slug_substrings=_flist(form, "target.exclude_slug_substrings"),
+    )
+    if is_new:
+        target = replace(
+            target,
+            address=str(form.get("target.address") or "").strip().lower(),
+        )
+    if target.sizing_mode not in ("scale", "fixed"):
+        errors.append("仓位模式必须是 scale 或 fixed")
+    if target.buy_price_min > target.buy_price_max:
+        errors.append("最低买入价不能高于最高买入价")
+    if target.min_notional_usd > target.max_notional_usd:
+        errors.append("单笔最小金额不能高于单笔最大金额")
+    if target.min_target_usd > target.max_target_usd:
+        errors.append("目标最小成交额不能高于最大成交额")
+    return target
+
+
 @app.get("/config", response_class=HTMLResponse)
-def config_page(request: Request, saved: str = "", mode_changed: str = "",
-                restart_requested: str = "", restart_error: str = ""):
+def config_page(request: Request, target: str = "", saved: str = "",
+                mode_changed: str = "", restart_requested: str = "",
+                restart_error: str = "", targets_changed: str = "",
+                delete_error: str = ""):
     redirect = _login_redirect(request)
     if redirect:
         return redirect
@@ -494,12 +646,27 @@ def config_page(request: Request, saved: str = "", mode_changed: str = "",
             "<p>请检查文件是否存在且为合法 TOML。</p>",
             status_code=500,
         )
-    name = next(iter(cfg.targets))
+    if target == "__new__":
+        target_key = "__new__"
+        target_cfg = _default_target()
+        is_new = True
+    else:
+        target_key = target if target in cfg.targets else next(iter(cfg.targets))
+        target_cfg = cfg.targets[target_key]
+        is_new = False
+    conn = queries.connect()
+    try:
+        pending = queries.active_pending_buys(conn)
+    finally:
+        queries.close(conn)
     return _render(
-        request, "config.html", "config", cfg=cfg, target_name=name,
-        target=cfg.targets[name], csrf=session.csrf if session else "",
+        request, "config.html", "config", cfg=cfg, target_name=target_key,
+        target_key=target_key, target=target_cfg, is_new=is_new,
+        csrf=session.csrf if session else "",
         saved=bool(saved), mode_changed=bool(mode_changed), error=None,
         restart_requested=bool(restart_requested), restart_error=restart_error,
+        targets_changed=bool(targets_changed), delete_error=delete_error,
+        pending_buys=pending,
         config_path=str(queries.CONFIG_PATH), db_path=str(queries.DB_PATH),
         run=cfg.run, live=cfg.live,
     )
@@ -559,8 +726,6 @@ async def config_save(request: Request):
     cfg = _load_cfg()
     if cfg is None or not cfg.targets:
         raise HTTPException(status_code=500, detail="无法读取当前配置")
-    name = next(iter(cfg.targets))
-    target = cfg.targets[name]
     errors: list[str] = []
 
     paper = replace(
@@ -577,6 +742,8 @@ async def config_save(request: Request):
         cash_reserve_pct=_fnum(form, "paper.cash_reserve_pct", cfg.paper.cash_reserve_pct, errors, "现金保留比例", 0, 0.9),
         settle_every_seconds=_fint(form, "paper.settle_every_seconds", cfg.paper.settle_every_seconds, errors, "结算检查间隔", 30, 86400),
         mark_every_seconds=_fint(form, "paper.mark_every_seconds", cfg.paper.mark_every_seconds, errors, "标记价格间隔", 30, 86400),
+        risk_check_seconds=_fint(form, "paper.risk_check_seconds", cfg.paper.risk_check_seconds, errors, "风控检查间隔", 5, 86400),
+        orphan_grace_seconds=_fnum(form, "paper.orphan_grace_seconds", cfg.paper.orphan_grace_seconds, errors, "新仓位保护期", 0, 3600),
         max_pages=_fint(form, "paper.max_pages", cfg.paper.max_pages, errors, "最大分页数", 1, 50),
         page_limit=_fint(form, "paper.page_limit", cfg.paper.page_limit, errors, "每页条数", 50, 1000),
     )
@@ -628,55 +795,67 @@ async def config_save(request: Request):
         if not live.private_key_env:
             errors.append("实盘非 dry-run 必须填写私钥环境变量名")
 
-    fee_override_raw = str(form.get("target.fee_rate", "")).strip()
-    fee_override: float | None = None
-    if fee_override_raw:
-        try:
-            fee_override = float(fee_override_raw)
-            if fee_override < 0 or fee_override > 0.5:
-                errors.append("目标手续费率必须在 0 到 0.5 之间")
-        except ValueError:
-            errors.append("目标手续费率不是有效数字")
-            fee_override = target.fee_rate
+    target_key = str(form.get("target_key") or "").strip()
+    is_new = target_key in ("", "__new__")
+    name = target_key
+    if is_new:
+        name = str(form.get("new_target_name") or "").strip()
+        if not TARGET_NAME_RE.match(name):
+            errors.append("跟单地址名称只能包含字母、数字、_、-，长度 1–32")
+        elif name in cfg.targets:
+            errors.append(f"跟单地址名称 {name!r} 已存在")
+        base = _default_target()
+    else:
+        if target_key not in cfg.targets:
+            errors.append("要编辑的跟单地址不存在，请刷新页面重试")
+            target_key = next(iter(cfg.targets))
+        base = cfg.targets[target_key]
+    new_target = _parse_target_form(
+        form, base, is_new=is_new, errors=errors)
+    if is_new and not TARGET_ADDRESS_RE.match(
+            str(form.get("target.address") or "").strip()):
+        errors.append("目标钱包地址必须是 0x 开头的 40 位十六进制地址")
 
-    new_target = replace(
-        target,
-        enabled=str(form.get("target.enabled") or "") in ("1", "on", "true", "yes"),
-        sizing_mode=str(form.get("target.sizing_mode") or target.sizing_mode),
-        scale_factor=_fnum(form, "target.scale_factor", target.scale_factor, errors, "跟单比例", 0.00001, 1),
-        fixed_notional_usd=_fnum(form, "target.fixed_notional_usd", target.fixed_notional_usd, errors, "固定跟单金额", 0, 1_000_000),
-        min_notional_usd=_fnum(form, "target.min_notional_usd", target.min_notional_usd, errors, "单笔最小金额", 0, 1_000_000),
-        max_notional_usd=_fnum(form, "target.max_notional_usd", target.max_notional_usd, errors, "单笔最大金额", 0, 1_000_000),
-        buy_price_min=_fnum(form, "target.buy_price_min", target.buy_price_min, errors, "最低买入价", 0, 1),
-        buy_price_max=_fnum(form, "target.buy_price_max", target.buy_price_max, errors, "最高买入价", 0, 1),
-        min_target_usd=_fnum(form, "target.min_target_usd", target.min_target_usd, errors, "目标最小成交额", 0, 1e12),
-        max_target_usd=_fnum(form, "target.max_target_usd", target.max_target_usd, errors, "目标最大成交额", 0, 1e12),
-        copy_sells=str(form.get("target.copy_sells") or "") in ("1", "on", "true", "yes"),
-        initial_lookback_seconds=_fint(form, "target.initial_lookback_seconds", target.initial_lookback_seconds, errors, "首次回溯秒数", 0, 86400),
-        max_market_usd=_fnum(form, "target.max_market_usd", target.max_market_usd, errors, "单市场敞口", 0, 1e9),
-        max_open_positions=_fint(form, "target.max_open_positions", target.max_open_positions, errors, "最大持仓数", 1, 10000),
-        fee_rate=fee_override,
-        exclude_event_substrings=_flist(form, "target.exclude_event_substrings"),
-        exclude_slug_substrings=_flist(form, "target.exclude_slug_substrings"),
-    )
-    if new_target.sizing_mode not in ("scale", "fixed"):
-        errors.append("仓位模式必须是 scale 或 fixed")
-    if new_target.buy_price_min > new_target.buy_price_max:
-        errors.append("最低买入价不能高于最高买入价")
-    if new_target.min_notional_usd > new_target.max_notional_usd:
-        errors.append("单笔最小金额不能高于单笔最大金额")
-    if new_target.min_target_usd > new_target.max_target_usd:
-        errors.append("目标最小成交额不能高于最大成交额")
+    targets = dict(cfg.targets)
+    saved_key = target_key
+    if is_new:
+        if TARGET_NAME_RE.match(name) and name not in cfg.targets:
+            targets[name] = new_target
+            saved_key = name
+    else:
+        targets[target_key] = new_target
+    for other_name, other in targets.items():
+        if other_name == saved_key:
+            continue
+        if other.address.lower() == new_target.address.lower():
+            errors.append(f"目标地址已存在于 {other_name!r}，不能重复")
+            break
 
     new_cfg = AppConfig(
         account=cfg.account, paper=paper, run=run_cfg, live=live,
-        targets={name: new_target}, path=cfg.path,
+        targets=targets, path=cfg.path,
     )
+
+    conn = queries.connect()
+    try:
+        active_pending = queries.active_pending_buys(conn)
+    finally:
+        queries.close(conn)
+    if active_pending and (mode != "live" or live.dry_run):
+        errors.append(
+            "存在未完成的实盘 maker 挂单，不能切换到 paper 或 dry-run；"
+            "请先在实盘处理完挂单")
+
     if errors:
         return _render(
             request, "config.html", "config", cfg=new_cfg, target_name=name,
-            target=new_target, csrf=session.csrf, saved=False,
+            target_key=("__new__" if is_new else saved_key),
+            target=new_target, is_new=is_new, new_target_name=name,
+            csrf=session.csrf, saved=False,
             mode_changed=False, error="；".join(errors),
+            restart_requested=False, restart_error=None,
+            targets_changed=False, delete_error="",
+            pending_buys=active_pending,
             config_path=str(queries.CONFIG_PATH),
             db_path=str(queries.DB_PATH), run=run_cfg, live=live,
         )
@@ -685,21 +864,97 @@ async def config_save(request: Request):
     except Exception as exc:  # noqa: BLE001
         return _render(
             request, "config.html", "config", cfg=new_cfg, target_name=name,
-            target=new_target, csrf=session.csrf, saved=False,
+            target_key=("__new__" if is_new else saved_key),
+            target=new_target, is_new=is_new, new_target_name=name,
+            csrf=session.csrf, saved=False,
             mode_changed=False, error=f"保存失败：{exc}",
+            restart_requested=False, restart_error=None,
+            targets_changed=False, delete_error="",
+            pending_buys=active_pending,
             config_path=str(queries.CONFIG_PATH),
             db_path=str(queries.DB_PATH), run=run_cfg, live=live,
         )
-    needs_restart = (run_cfg != cfg.run or live != cfg.live)
+    targets_changed = _enabled_addresses(cfg) != _enabled_addresses(new_cfg)
+    needs_restart = (
+        run_cfg != cfg.run or live != cfg.live or targets_changed)
+    restart_requested = False
     restart_error = None
-    if _fbool(form, "restart"):
+    if _fbool(form, "restart") or targets_changed:
         restart_error = queries.request_restart()
+        restart_requested = restart_error is None
     suffix = "&mode_changed=1" if needs_restart else ""
-    if _fbool(form, "restart") and not restart_error:
+    if targets_changed:
+        suffix += "&targets_changed=1"
+    if restart_requested:
         suffix += "&restart_requested=1"
     if restart_error:
         suffix += "&restart_error=" + urllib.parse.quote(str(restart_error))
-    return RedirectResponse(f"/config?saved=1{suffix}", status_code=303)
+    return RedirectResponse(
+        f"/config?target={urllib.parse.quote(saved_key)}&saved=1{suffix}",
+        status_code=303,
+    )
+
+
+@app.post("/config/target/delete")
+def config_target_delete(request: Request, target_key: str = Form(""),
+                         csrf: str = Form("")):
+    session = auth.current_session(request)
+    if session is None:
+        return RedirectResponse("/login?next=/config", status_code=302)
+    if not secrets.compare_digest(str(csrf or ""), session.csrf):
+        raise HTTPException(status_code=400, detail="CSRF 校验失败，请刷新页面重试")
+    cfg = _load_cfg()
+    if cfg is None or target_key not in cfg.targets:
+        return RedirectResponse(
+            "/config?delete_error="
+            + urllib.parse.quote("跟单地址不存在，请刷新页面重试"),
+            status_code=303,
+        )
+    if len(cfg.targets) <= 1:
+        return RedirectResponse(
+            f"/config?target={urllib.parse.quote(target_key)}&delete_error="
+            + urllib.parse.quote("至少保留一个跟单地址"),
+            status_code=303,
+        )
+    conn = queries.connect()
+    try:
+        blocking = queries.target_blocking_work(
+            conn, cfg.targets[target_key].address)
+    finally:
+        queries.close(conn)
+    if blocking:
+        return RedirectResponse(
+            f"/config?target={urllib.parse.quote(target_key)}&delete_error="
+            + urllib.parse.quote(f"该地址还有{blocking}，不能删除"),
+            status_code=303,
+        )
+    targets = {
+        key: value for key, value in cfg.targets.items()
+        if key != target_key
+    }
+    new_cfg = AppConfig(
+        account=cfg.account, paper=cfg.paper, run=cfg.run, live=cfg.live,
+        targets=targets, path=cfg.path,
+    )
+    try:
+        config_io.save_config(new_cfg, queries.CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return RedirectResponse(
+            f"/config?target={urllib.parse.quote(target_key)}&delete_error="
+            + urllib.parse.quote(f"保存失败：{exc}"),
+            status_code=303,
+        )
+    restart_error = queries.request_restart()
+    first = next(iter(targets))
+    suffix = "&targets_changed=1"
+    if restart_error is None:
+        suffix += "&restart_requested=1"
+    else:
+        suffix += "&restart_error=" + urllib.parse.quote(str(restart_error))
+    return RedirectResponse(
+        f"/config?target={urllib.parse.quote(first)}{suffix}",
+        status_code=303,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -746,22 +1001,26 @@ def api_fills(request: Request, side: str = "", fill_type: str = "",
 
 
 @app.get("/api/positions")
-def api_positions(request: Request, status: str = "open", page: int = 1):
+def api_positions(request: Request, status: str = "open", page: int = 1,
+                  target: str = ""):
     _require_api(request)
     conn = queries.connect()
     try:
-        return queries.positions_page(conn, status=status, page=page, per_page=100)
+        return queries.positions_page(
+            conn, status=status, page=page, per_page=100, target=target)
     finally:
         queries.close(conn)
 
 
 @app.get("/api/signals")
-def api_signals(request: Request, copied: str = "", reason: str = "", page: int = 1):
+def api_signals(request: Request, copied: str = "", reason: str = "",
+                target: str = "", page: int = 1):
     _require_api(request)
     conn = queries.connect()
     try:
         return queries.signals_page(
-            conn, copied=copied, reason=reason, page=page, per_page=100
+            conn, copied=copied, reason=reason, target=target,
+            page=page, per_page=100
         )
     finally:
         queries.close(conn)

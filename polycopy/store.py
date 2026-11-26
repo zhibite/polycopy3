@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ CREATE TABLE IF NOT EXISTS account (
 );
 
 CREATE TABLE IF NOT EXISTS target_fills (
-    dedupe_key TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL,
     target TEXT NOT NULL,
     ts INTEGER NOT NULL,
     kind TEXT NOT NULL,
@@ -33,7 +34,8 @@ CREATE TABLE IF NOT EXISTS target_fills (
     slug TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
     raw TEXT NOT NULL DEFAULT '',
-    processed_at INTEGER NOT NULL
+    processed_at INTEGER NOT NULL,
+    PRIMARY KEY (target, dedupe_key)
 );
 CREATE INDEX IF NOT EXISTS idx_target_fills_target_ts ON target_fills(target, ts);
 
@@ -138,7 +140,7 @@ CREATE TABLE IF NOT EXISTS orders (
     raw TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    UNIQUE(dedupe_key, side, mode)
+    UNIQUE(target, dedupe_key, side, mode)
 );
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_token ON orders(token_id);
@@ -170,12 +172,49 @@ CREATE TABLE IF NOT EXISTS pending_exits (
     outcome TEXT NOT NULL DEFAULT '',
     shares REAL NOT NULL,
     reason TEXT,
+    kind TEXT NOT NULL DEFAULT 'COPY',
     attempts INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(target, condition_id, token_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_exits_target ON pending_exits(target);
+
+CREATE TABLE IF NOT EXISTS pending_buys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_key TEXT NOT NULL,
+    target TEXT NOT NULL,
+    condition_id TEXT NOT NULL DEFAULT '',
+    token_id TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    event_slug TEXT NOT NULL DEFAULT '',
+    slug TEXT NOT NULL DEFAULT '',
+    signal_price REAL NOT NULL DEFAULT 0,
+    limit_price REAL NOT NULL DEFAULT 0,
+    fee_rate REAL NOT NULL DEFAULT 0,
+    shares REAL NOT NULL DEFAULT 0,
+    target_shares_at_entry REAL NOT NULL DEFAULT 0,
+    target_sold_fraction REAL NOT NULL DEFAULT 0,
+    filled_shares REAL NOT NULL DEFAULT 0,
+    notional REAL NOT NULL DEFAULT 0,
+    fee REAL NOT NULL DEFAULT 0,
+    end_ts INTEGER NOT NULL DEFAULT 0,
+    order_id INTEGER,
+    fak_order_id INTEGER,
+    deadline_ts INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'SUBMITTING',
+    cancel_confirmed INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    signal_ts INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'onchain',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(target, signal_key)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_buys_status ON pending_buys(status);
+CREATE INDEX IF NOT EXISTS idx_pending_buys_token ON pending_buys(target, token_id);
 
 CREATE TABLE IF NOT EXISTS manual_sells (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,6 +313,7 @@ class Store:
                 "UPDATE signals SET slug = COALESCE(("
                 " SELECT tf.slug FROM target_fills tf"
                 " WHERE tf.dedupe_key = signals.dedupe_key"
+                " AND tf.target = signals.target"
                 " AND tf.slug != '' LIMIT 1), '')"
                 " WHERE slug = ''")
         if "slug" not in pos_cols:
@@ -287,6 +327,174 @@ class Store:
                 " AND tf.token_id = positions.token_id"
                 " AND tf.slug != '' ORDER BY tf.ts DESC LIMIT 1), '')"
                 " WHERE slug = ''")
+        exit_cols = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(pending_exits)")
+        }
+        if exit_cols and "kind" not in exit_cols:
+            self.conn.execute(
+                "ALTER TABLE pending_exits ADD COLUMN kind TEXT NOT NULL"
+                " DEFAULT 'COPY'")
+        self._migrate_multi_target_keys()
+
+    # -------------------------------------------------- multi-target schemas
+    def _table_sql(self, name: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return str(row["sql"]) if row and row["sql"] else None
+
+    @staticmethod
+    def _norm_sql(sql: str | None) -> str:
+        return " ".join((sql or "").lower().split())
+
+    def _backup_database(self) -> None:
+        """One-time backup before rebuilding multi-target unique keys."""
+        backup = self.path.with_name(self.path.name + ".pre-multitarget.bak")
+        if backup.exists():
+            return
+        tmp = backup.with_name(backup.name + ".tmp")
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        dest = sqlite3.connect(str(tmp))
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+        os.replace(tmp, backup)
+
+    def _migrate_multi_target_keys(self) -> None:
+        """Scope target_fills/orders uniqueness by target wallet.
+
+        Before this migration both tables were keyed by dedupe_key alone, so
+        two target wallets whose fills landed in the same transaction with
+        identical size/price could silently drop the second fill or reuse the
+        first target's order row.
+        """
+        if self.get_kv("schema:multi_target_keys") == "1":
+            return
+        tf_sql = self._norm_sql(self._table_sql("target_fills"))
+        order_sql = self._norm_sql(self._table_sql("orders"))
+        tf_ok = not tf_sql or "primary key (target, dedupe_key)" in tf_sql
+        orders_ok = (not order_sql
+                     or "unique(target, dedupe_key, side, mode)" in order_sql)
+        if tf_ok and orders_ok:
+            self.set_kv("schema:multi_target_keys", "1")
+            self.conn.commit()
+            return
+
+        self._backup_database()
+        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not tf_ok:
+                self._rebuild_target_fills()
+            if not orders_ok:
+                self._rebuild_orders()
+            self.set_kv("schema:multi_target_keys", "1")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _rebuild_target_fills(self) -> None:
+        old_cols = [row[1] for row in self.conn.execute(
+            "PRAGMA table_info(target_fills)")]
+        new_cols = [
+            "dedupe_key", "target", "ts", "kind", "condition_id", "token_id",
+            "side", "price", "size", "usd", "outcome", "event_slug", "slug",
+            "title", "raw", "processed_at",
+        ]
+        common = [c for c in new_cols if c in old_cols]
+        col_sql = ", ".join(common)
+        self.conn.execute("ALTER TABLE target_fills RENAME TO target_fills_old")
+        self.conn.execute("DROP INDEX IF EXISTS idx_target_fills_target_ts")
+        self.conn.execute(
+            """
+            CREATE TABLE target_fills (
+                dedupe_key TEXT NOT NULL,
+                target TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                condition_id TEXT NOT NULL DEFAULT '',
+                token_id TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                price REAL NOT NULL DEFAULT 0,
+                size REAL NOT NULL DEFAULT 0,
+                usd REAL NOT NULL DEFAULT 0,
+                outcome TEXT NOT NULL DEFAULT '',
+                event_slug TEXT NOT NULL DEFAULT '',
+                slug TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                raw TEXT NOT NULL DEFAULT '',
+                processed_at INTEGER NOT NULL,
+                PRIMARY KEY (target, dedupe_key)
+            )
+            """)
+        if common:
+            self.conn.execute(
+                f"INSERT INTO target_fills ({col_sql})"
+                f" SELECT {col_sql} FROM target_fills_old")
+        self.conn.execute("DROP TABLE target_fills_old")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_target_fills_target_ts"
+            " ON target_fills(target, ts)")
+
+    def _rebuild_orders(self) -> None:
+        old_cols = [row[1] for row in self.conn.execute(
+            "PRAGMA table_info(orders)")]
+        new_cols = [
+            "id", "dedupe_key", "target", "mode", "side", "condition_id",
+            "token_id", "outcome", "title", "event_slug", "limit_price",
+            "size", "filled_size", "avg_price", "fee", "fee_rate", "status",
+            "reason", "client_order_id", "exchange_order_id", "raw",
+            "created_at", "updated_at",
+        ]
+        common = [c for c in new_cols if c in old_cols]
+        col_sql = ", ".join(common)
+        self.conn.execute("ALTER TABLE orders RENAME TO orders_old")
+        self.conn.execute("DROP INDEX IF EXISTS idx_orders_status")
+        self.conn.execute("DROP INDEX IF EXISTS idx_orders_token")
+        self.conn.execute(
+            """
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedupe_key TEXT NOT NULL,
+                target TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'live',
+                side TEXT NOT NULL,
+                condition_id TEXT NOT NULL DEFAULT '',
+                token_id TEXT NOT NULL,
+                outcome TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                event_slug TEXT NOT NULL DEFAULT '',
+                limit_price REAL NOT NULL DEFAULT 0,
+                size REAL NOT NULL DEFAULT 0,
+                filled_size REAL NOT NULL DEFAULT 0,
+                avg_price REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                fee_rate REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                reason TEXT,
+                client_order_id TEXT,
+                exchange_order_id TEXT,
+                raw TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(target, dedupe_key, side, mode)
+            )
+            """)
+        if common:
+            self.conn.execute(
+                f"INSERT INTO orders ({col_sql})"
+                f" SELECT {col_sql} FROM orders_old")
+        self.conn.execute("DROP TABLE orders_old")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_token ON orders(token_id)")
 
     # ------------------------------------------------------------------ account
     def ensure_account(self, starting_cash: float) -> None:
@@ -424,7 +632,7 @@ class Store:
     # ------------------------------------------------------------ pending exits
     def queue_pending_exit(self, *, target: str, condition_id: str, token_id: str,
                            outcome: str, shares: float, reason: str,
-                           ts: int) -> None:
+                           ts: int, kind: str = "COPY") -> None:
         """Remember an unfilled target exit; retried by the engine.
 
         Shares are capped at the current paper position, so a stale pending
@@ -444,15 +652,16 @@ class Store:
         if row:
             self.conn.execute(
                 "UPDATE pending_exits SET shares = ?, outcome = ?, reason = ?,"
-                " updated_at = ? WHERE id = ?",
-                (total, outcome, reason, ts, row["id"]),
+                " kind = ?, updated_at = ? WHERE id = ?",
+                (total, outcome, reason, kind, ts, row["id"]),
             )
         else:
             self.conn.execute(
                 "INSERT INTO pending_exits(target, condition_id, token_id, outcome,"
-                " shares, reason, attempts, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,0,?,?)",
-                (target, condition_id, token_id, outcome, total, reason, ts, ts),
+                " shares, reason, kind, attempts, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,0,?,?)",
+                (target, condition_id, token_id, outcome, total, reason, kind,
+                 ts, ts),
             )
 
     def pending_exit(self, target: str, condition_id: str,
@@ -491,6 +700,240 @@ class Store:
             " AND token_id = ?",
             (target, condition_id, token_id),
         )
+
+    # ----------------------------------------------------------- pending buys
+    def create_pending_buy(self, *, signal_key: str, target: str,
+                           condition_id: str, token_id: str, outcome: str,
+                           title: str, event_slug: str, slug: str,
+                           signal_price: float, limit_price: float,
+                           fee_rate: float, shares: float,
+                           target_shares_at_entry: float, end_ts: int,
+                           deadline_ts: int, signal_ts: int,
+                           source: str = "onchain", order_id: int | None = None,
+                           status: str = "SUBMITTING",
+                           ts: int | None = None) -> int:
+        now = int(ts or time.time())
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO pending_buys(signal_key, target,"
+            " condition_id, token_id, outcome, title, event_slug, slug,"
+            " signal_price, limit_price, fee_rate, shares,"
+            " target_shares_at_entry, end_ts, order_id, deadline_ts, status,"
+            " signal_ts, source, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (signal_key, target, condition_id, token_id, outcome, title,
+             event_slug, slug, float(signal_price), float(limit_price),
+             float(fee_rate), float(shares), float(target_shares_at_entry),
+             int(end_ts or 0), order_id, int(deadline_ts), status,
+             int(signal_ts), source, now, now),
+        )
+        if cur.rowcount > 0:
+            return int(cur.lastrowid or 0)
+        row = self.pending_buy_for(target, signal_key)
+        return int(row["id"]) if row else 0
+
+    def pending_buy(self, pending_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM pending_buys WHERE id = ?", (int(pending_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def pending_buy_for(self, target: str,
+                        signal_key: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM pending_buys WHERE target = ? AND signal_key = ?",
+            (target, signal_key),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def pending_buys(self, statuses: tuple[str, ...] | None = None, *,
+                     target: str | None = None) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if statuses:
+            where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+        if target is not None:
+            where.append("target = ?")
+            params.append(target)
+        sql = "SELECT * FROM pending_buys"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_pending_buys(self, target: str, condition_id: str,
+                            token_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM pending_buys WHERE target = ? AND condition_id = ?"
+            " AND token_id = ? AND status IN"
+            " ('SUBMITTING','PENDING','CANCEL_REQUESTED','TAIL_SUBMITTED')"
+            " ORDER BY id",
+            (target, condition_id, token_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def request_cancel_pending_buys(self, target: str, condition_id: str,
+                                    token_id: str, reason: str,
+                                    ts: int | None = None,
+                                    target_sold_fraction: float | None = None
+                                    ) -> int:
+        now = int(ts or time.time())
+        if target_sold_fraction is None:
+            cur = self.conn.execute(
+                "UPDATE pending_buys SET status = 'CANCEL_REQUESTED',"
+                " reason = ?, updated_at = ? WHERE target = ?"
+                " AND condition_id = ? AND token_id = ?"
+                " AND status IN ('SUBMITTING','PENDING')",
+                (reason, now, target, condition_id, token_id),
+            )
+        else:
+            cur = self.conn.execute(
+                "UPDATE pending_buys SET status = 'CANCEL_REQUESTED',"
+                " reason = ?, target_sold_fraction = MAX("
+                " target_sold_fraction, ?), updated_at = ? WHERE target = ?"
+                " AND condition_id = ? AND token_id = ?"
+                " AND status IN ('SUBMITTING','PENDING')",
+                (reason, float(target_sold_fraction), now, target,
+                 condition_id, token_id),
+            )
+        return int(cur.rowcount or 0)
+
+    def request_cancel_pending_buys_for_condition(
+            self, target: str, condition_id: str, reason: str,
+            ts: int | None = None) -> int:
+        cur = self.conn.execute(
+            "UPDATE pending_buys SET status = 'CANCEL_REQUESTED', reason = ?,"
+            " updated_at = ? WHERE target = ? AND condition_id = ?"
+            " AND status IN ('SUBMITTING','PENDING')",
+            (reason, int(ts or time.time()), target, condition_id),
+        )
+        return int(cur.rowcount or 0)
+
+    def update_pending_buy(self, pending_id: int, *,
+                           status: str | None = None,
+                           reason: str | None = None,
+                           order_id: int | None = None,
+                           fak_order_id: int | None = None,
+                           shares: float | None = None,
+                           limit_price: float | None = None,
+                           filled_shares: float | None = None,
+                           notional: float | None = None,
+                           fee: float | None = None,
+                           deadline_ts: int | None = None,
+                           cancel_confirmed: int | None = None,
+                           attempts: int | None = None,
+                           target_sold_fraction: float | None = None,
+                           ts: int | None = None) -> None:
+        updates: list[str] = ["updated_at = ?"]
+        params: list[Any] = [int(ts or time.time())]
+        mapping = {
+            "status": status, "reason": reason, "order_id": order_id,
+            "fak_order_id": fak_order_id, "shares": shares,
+            "limit_price": limit_price, "filled_shares": filled_shares,
+            "notional": notional, "fee": fee, "deadline_ts": deadline_ts,
+            "cancel_confirmed": cancel_confirmed, "attempts": attempts,
+            "target_sold_fraction": target_sold_fraction,
+        }
+        for column, value in mapping.items():
+            if value is not None:
+                updates.append(f"{column} = ?")
+                params.append(value)
+        params.append(int(pending_id))
+        self.conn.execute(
+            "UPDATE pending_buys SET " + ", ".join(updates) + " WHERE id = ?",
+            params,
+        )
+
+    def transition_pending_buy(self, pending_id: int, *,
+                               from_statuses: tuple[str, ...],
+                               to_status: str, reason: str | None = None,
+                               ts: int | None = None,
+                               **fields: Any) -> bool:
+        """Conditional status transition (used to win cancel/timeout races)."""
+        if not from_statuses:
+            return False
+        allowed = {
+            "reason", "order_id", "fak_order_id", "shares", "limit_price",
+            "filled_shares", "notional", "fee", "deadline_ts",
+            "cancel_confirmed", "attempts", "target_sold_fraction",
+        }
+        updates = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [to_status, int(ts or time.time())]
+        if reason is not None:
+            updates.append("reason = ?")
+            params.append(reason)
+        for column, value in fields.items():
+            if column not in allowed:
+                raise ValueError(f"unknown pending_buy field {column!r}")
+            if value is None:
+                continue
+            updates.append(f"{column} = ?")
+            params.append(value)
+        params.append(int(pending_id))
+        placeholders = ",".join("?" for _ in from_statuses)
+        params.extend(from_statuses)
+        cur = self.conn.execute(
+            "UPDATE pending_buys SET " + ", ".join(updates)
+            + f" WHERE id = ? AND status IN ({placeholders})",
+            params,
+        )
+        return bool(cur.rowcount)
+
+    def pending_buy_commitment(self, *, target: str | None = None,
+                               condition_id: str | None = None,
+                               exclude_id: int | None = None) -> float:
+        where = ["status IN ('SUBMITTING','PENDING','CANCEL_REQUESTED')"]
+        params: list[Any] = []
+        if target is not None:
+            where.append("target = ?")
+            params.append(target)
+        if condition_id is not None:
+            where.append("condition_id = ?")
+            params.append(condition_id)
+        if exclude_id is not None:
+            where.append("id != ?")
+            params.append(int(exclude_id))
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(MAX(shares - filled_shares, 0) * limit_price),"
+            " 0) AS v FROM pending_buys WHERE " + " AND ".join(where),
+            params,
+        ).fetchone()
+        return float(row["v"]) if row else 0.0
+
+    def count_pending_buy_tokens(self, target: str | None = None) -> int:
+        where = ["status IN ('SUBMITTING','PENDING','CANCEL_REQUESTED')"]
+        params: list[Any] = []
+        if target is not None:
+            where.append("target = ?")
+            params.append(target)
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT target || '|' || token_id) AS c"
+            " FROM pending_buys WHERE " + " AND ".join(where),
+            params,
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def fill_totals_for_order(self,
+                              order_id: int) -> tuple[float, float, float]:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(shares), 0) AS s,"
+            " COALESCE(SUM(notional), 0) AS n, COALESCE(SUM(fee), 0) AS f"
+            " FROM fills WHERE order_id = ?",
+            (int(order_id),),
+        ).fetchone()
+        if not row:
+            return 0.0, 0.0, 0.0
+        return float(row["s"]), float(row["n"]), float(row["f"])
+
+    def has_pending_manual_sell(self, target: str, condition_id: str,
+                                token_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM manual_sells WHERE target = ? AND condition_id = ?"
+            " AND token_id = ? AND status IN ('PENDING', 'PARTIAL') LIMIT 1",
+            (target, condition_id, token_id),
+        ).fetchone()
+        return row is not None
 
     def consume_manual_credit(self, target: str, condition_id: str,
                               token_id: str, basis_reduction: float,
@@ -614,8 +1057,9 @@ class Store:
              float(fee_rate), status, reason, client_order_id, "", now, now),
         )
         row = self.conn.execute(
-            "SELECT * FROM orders WHERE dedupe_key = ? AND side = ? AND mode = ?",
-            (dedupe_key, side, mode),
+            "SELECT * FROM orders WHERE target = ? AND dedupe_key = ?"
+            " AND side = ? AND mode = ?",
+            (target, dedupe_key, side, mode),
         ).fetchone()
         return dict(row) if row else {}
 
@@ -624,12 +1068,20 @@ class Store:
             "SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
         return dict(row) if row else None
 
-    def order_for(self, dedupe_key: str, side: str,
-                  mode: str = "live") -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT * FROM orders WHERE dedupe_key = ? AND side = ? AND mode = ?",
-            (dedupe_key, side, mode),
-        ).fetchone()
+    def order_for(self, dedupe_key: str, side: str, mode: str = "live",
+                  target: str | None = None) -> dict[str, Any] | None:
+        if target is None:
+            row = self.conn.execute(
+                "SELECT * FROM orders WHERE dedupe_key = ? AND side = ?"
+                " AND mode = ? ORDER BY id LIMIT 1",
+                (dedupe_key, side, mode),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT * FROM orders WHERE target = ? AND dedupe_key = ?"
+                " AND side = ? AND mode = ?",
+                (target, dedupe_key, side, mode),
+            ).fetchone()
         return dict(row) if row else None
 
     def orders(self, *, mode: str = "live",
@@ -714,6 +1166,21 @@ class Store:
             ),
         )
 
+    def update_signal_result(self, target: str, dedupe_key: str, *,
+                             copied: bool, reason: str | None,
+                             our_shares: float | None = None,
+                             our_price: float | None = None,
+                             our_notional: float | None = None,
+                             our_fee: float | None = None) -> None:
+        """Update a maker_pending signal once its entry reaches a terminal state."""
+        self.conn.execute(
+            "UPDATE signals SET copied = ?, reason = ?, our_shares = ?,"
+            " our_price = ?, our_notional = ?, our_fee = ?"
+            " WHERE target = ? AND dedupe_key = ?",
+            (1 if copied else 0, reason, our_shares, our_price, our_notional,
+             our_fee, target, dedupe_key),
+        )
+
     def signal_for(self, target: str,
                    dedupe_key: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -754,18 +1221,24 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def count_open_positions(self) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM positions WHERE status = 'OPEN'"
-        ).fetchone()
+    def count_open_positions(self, target: str | None = None) -> int:
+        sql = "SELECT COUNT(*) AS c FROM positions WHERE status = 'OPEN'"
+        params: list[Any] = []
+        if target is not None:
+            sql += " AND target = ?"
+            params.append(target)
+        row = self.conn.execute(sql, params).fetchone()
         return int(row["c"]) if row else 0
 
-    def market_exposure(self, condition_id: str) -> float:
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(shares * avg_cost), 0) AS v FROM positions"
-            " WHERE condition_id = ? AND status = 'OPEN'",
-            (condition_id,),
-        ).fetchone()
+    def market_exposure(self, condition_id: str,
+                        target: str | None = None) -> float:
+        sql = ("SELECT COALESCE(SUM(shares * avg_cost), 0) AS v FROM positions"
+               " WHERE condition_id = ? AND status = 'OPEN'")
+        params: list[Any] = [condition_id]
+        if target is not None:
+            sql += " AND target = ?"
+            params.append(target)
+        row = self.conn.execute(sql, params).fetchone()
         return float(row["v"]) if row else 0.0
 
     def apply_buy(self, *, ts: int, target: str, signal_id: int | None,
@@ -895,17 +1368,25 @@ class Store:
 
     def settle_position(self, pos: dict[str, Any], payout_per_share: float,
                         ts: int) -> float:
-        if pos.get("status") != "OPEN":
+        # Re-read inside the write transaction: a risk/target/manual sell may
+        # have reduced or closed this position since the settlement scan.
+        row = self.conn.execute(
+            "SELECT * FROM positions WHERE id = ? AND status = 'OPEN'",
+            (int(pos["id"]),),
+        ).fetchone()
+        if row is None:
             return 0.0
-        shares = float(pos["shares"])
-        avg_cost = float(pos["avg_cost"])
+        shares = float(row["shares"])
+        avg_cost = float(row["avg_cost"])
+        if shares <= 1e-12:
+            return 0.0
         payout = shares * payout_per_share
         realized = payout - shares * avg_cost
         self.conn.execute(
             "UPDATE positions SET shares = 0, basis_shares = 0,"
             " manual_credit = 0, status = 'CLOSED',"
             " realized_pnl = realized_pnl + ?, updated_at = ? WHERE id = ?",
-            (realized, ts, pos["id"]),
+            (realized, ts, row["id"]),
         )
         self.conn.execute(
             "UPDATE account SET cash = cash + ?, realized_pnl = realized_pnl + ?"
@@ -915,11 +1396,11 @@ class Store:
         self.conn.execute(
             "INSERT INTO settlements(ts, condition_id, token_id, outcome, shares,"
             " payout, realized_pnl) VALUES (?,?,?,?,?,?,?)",
-            (ts, pos["condition_id"], pos["token_id"], pos.get("outcome"),
+            (ts, row["condition_id"], row["token_id"], row["outcome"],
              shares, payout, realized),
         )
-        self.clear_pending_exits(pos["target"], pos["condition_id"],
-                                 pos["token_id"])
+        self.clear_pending_exits(row["target"], row["condition_id"],
+                                 row["token_id"])
         return realized
 
     # ------------------------------------------------------------------ marks

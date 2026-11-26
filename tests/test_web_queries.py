@@ -157,6 +157,61 @@ class WebQueriesTest(unittest.TestCase):
         self.assertEqual(summary[None]["n"], 1)
         self.assertEqual(summary["price_out_of_range"]["n"], 1)
 
+    def test_target_filters_and_risk_fill_type(self):
+        self.store.apply_buy(
+            ts=1, target="t1", signal_id=None, condition_id="c1",
+            token_id="k1", outcome="Yes", title="M1", event_slug="e",
+            shares=10, price=0.5, fee=0.0)
+        self.store.apply_buy(
+            ts=2, target="t2", signal_id=None, condition_id="c2",
+            token_id="k2", outcome="Yes", title="M2", event_slug="e",
+            shares=10, price=0.5, fee=0.0)
+        self.store.apply_sell(
+            ts=3, target="t1", signal_id=None, condition_id="c1",
+            token_id="k1", outcome="Yes", shares=10, price=0.6, fee=0.0,
+            note="take_profit", kind="RISK")
+        for target, key in (("t1", "s1"), ("t2", "s2")):
+            self.store.record_signal(
+                target=target, dedupe_key=key, ts=4,
+                latency_seconds=1.0, side="BUY", condition_id="c",
+                token_id="k", outcome="Yes", price=0.5, size=10, usd=5.0,
+                title="M", event_slug="e", copied=False,
+                reason="maker_pending",
+            )
+        self.store.commit()
+        conn = queries.connect()
+        self.addCleanup(queries.close, conn)
+        self.assertEqual(
+            queries.positions_page(conn, status="all", target="t1")["total"], 1)
+        self.assertEqual(
+            queries.positions_page(conn, status="all", target="t2")["total"], 1)
+        self.assertEqual(
+            queries.signals_page(conn, target="t1")["total"], 1)
+        self.assertEqual(
+            queries.signals_page(conn, target="t2")["total"], 1)
+        self.assertEqual(
+            queries.fills_page(conn, fill_type="risk")["total"], 1)
+        self.assertEqual(
+            queries.fills_page(conn, fill_type="copy_sell")["total"], 0)
+        self.assertEqual(
+            queries.target_blocking_work(conn, "t2"), "未平仓持仓")
+        self.assertIsNone(queries.target_blocking_work(conn, "t1"))
+
+    def test_active_pending_buys(self):
+        self.store.create_pending_buy(
+            signal_key="s1", target="t1", condition_id="c1",
+            token_id="k1", outcome="Yes", title="M", event_slug="e",
+            slug="", signal_price=0.5, limit_price=0.5, fee_rate=0.0,
+            shares=10, target_shares_at_entry=0, end_ts=0,
+            deadline_ts=9999999999, signal_ts=1, source="test",
+        )
+        self.store.commit()
+        conn = queries.connect()
+        self.addCleanup(queries.close, conn)
+        rows = queries.active_pending_buys(conn)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["target"], "t1")
+
 
 if __name__ == "__main__":
     unittest.main()

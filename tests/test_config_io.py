@@ -113,6 +113,68 @@ class ConfigIOTest(unittest.TestCase):
             self.assertEqual(cfg.run.mode, "paper")
             self.assertTrue(cfg.live.dry_run)
 
+    def test_multi_target_and_maker_fields_roundtrip(self):
+        cfg = AppConfig(
+            account=AccountConfig(),
+            paper=PaperConfig(
+                risk_check_seconds=45, orphan_grace_seconds=90.0),
+            targets={
+                "a": TargetConfig(
+                    address="0xAAA", sizing_mode="fixed",
+                    fixed_notional_usd=10.0, min_target_usd=1000.0,
+                    min_hours_to_end=2.0, maker_entry_enabled=True,
+                    maker_timeout_seconds=300, fak_max_premium_pct=0.02,
+                    take_profit_pct=0.10, stop_loss_pct=0.20,
+                ),
+                "b": TargetConfig(
+                    address="0xbbb", sizing_mode="fixed",
+                    fixed_notional_usd=20.0, min_hours_to_end=0.0,
+                    maker_entry_enabled=False,
+                ),
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            config_io.save_config(cfg, path)
+            loaded = load_config(path)
+            self.assertEqual(sorted(loaded.targets), ["a", "b"])
+            self.assertEqual(loaded.targets["a"].address, "0xaaa")
+            self.assertEqual(loaded.targets["b"].address, "0xbbb")
+            self.assertAlmostEqual(
+                loaded.targets["a"].fixed_notional_usd, 10.0)
+            self.assertAlmostEqual(loaded.targets["b"].fixed_notional_usd, 20.0)
+            self.assertAlmostEqual(
+                loaded.targets["a"].min_hours_to_end, 2.0)
+            self.assertTrue(loaded.targets["a"].maker_entry_enabled)
+            self.assertFalse(loaded.targets["b"].maker_entry_enabled)
+            self.assertAlmostEqual(
+                loaded.targets["a"].take_profit_pct, 0.10)
+            self.assertAlmostEqual(
+                loaded.targets["a"].stop_loss_pct, 0.20)
+            self.assertEqual(loaded.paper.risk_check_seconds, 45)
+            self.assertAlmostEqual(loaded.paper.orphan_grace_seconds, 90.0)
+
+    def test_duplicate_target_address_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(
+                "[account]\nstarting_cash = 1000.0\n\n"
+                "[targets.a]\naddress = \"0xAbC\"\n\n"
+                "[targets.b]\naddress = \"0xabc\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_config(path)
+
+    def test_unsafe_target_name_is_rejected_on_save(self):
+        cfg = AppConfig(
+            account=AccountConfig(), paper=PaperConfig(),
+            targets={"bad name": TargetConfig(address="0xabc")},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                config_io.save_config(cfg, Path(tmp) / "config.toml")
+
 
 if __name__ == "__main__":
     unittest.main()

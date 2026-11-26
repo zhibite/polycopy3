@@ -360,10 +360,14 @@ def fills_page(conn: sqlite3.Connection | None, *, side: str = "",
         params.append(side)
     if fill_type == "manual_sell":
         where.append("f.kind = 'MANUAL'")
+    elif fill_type == "risk":
+        where.append("f.kind = 'RISK'")
     elif fill_type == "copy_buy":
-        where.append("f.kind != 'MANUAL' AND f.side = 'BUY'")
+        where.append(
+            "f.kind NOT IN ('MANUAL', 'RISK') AND f.side = 'BUY'")
     elif fill_type == "copy_sell":
-        where.append("f.kind != 'MANUAL' AND f.side = 'SELL'")
+        where.append(
+            "f.kind NOT IN ('MANUAL', 'RISK') AND f.side = 'SELL'")
     if target:
         where.append("f.target = ?")
         params.append(target)
@@ -403,21 +407,28 @@ def fills_page(conn: sqlite3.Connection | None, *, side: str = "",
 
 
 def positions_page(conn: sqlite3.Connection | None, *, status: str = "open",
-                   page: int = 1, per_page: int = PAGE_DEFAULT) -> dict[str, Any]:
+                   page: int = 1, per_page: int = PAGE_DEFAULT,
+                   target: str = "") -> dict[str, Any]:
     status = status if status in ("open", "closed", "all") else "open"
-    where = ""
+    clauses: list[str] = []
+    params: list[Any] = []
     if status == "open":
-        where = " WHERE p.status = 'OPEN'"
+        clauses.append("p.status = 'OPEN'")
     elif status == "closed":
-        where = " WHERE p.status = 'CLOSED'"
+        clauses.append("p.status = 'CLOSED'")
+    if target:
+        clauses.append("p.target = ?")
+        params.append(target)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     offset, limit = _page_bounds(page, per_page)
-    total = int(_scalar(conn, "SELECT COUNT(*) FROM positions p" + where))
+    total = int(_scalar(
+        conn, "SELECT COUNT(*) FROM positions p" + where, params))
     rows = _all(
         conn,
         "SELECT p.*, m.bid AS mark_bid, m.ask AS mark_ask, m.mid AS mark_mid"
         " FROM positions p LEFT JOIN marks m ON m.token_id = p.token_id"
         + where + " ORDER BY p.updated_at DESC, p.id DESC LIMIT ? OFFSET ?",
-        (limit, offset),
+        params + [limit, offset],
     )
     totals = _one(
         conn,
@@ -426,16 +437,18 @@ def positions_page(conn: sqlite3.Connection | None, *, status: str = "open",
         " COALESCE(SUM(p.shares * (COALESCE(m.mid, p.avg_cost) - p.avg_cost)),0)"
         " AS unrealized, COALESCE(SUM(p.realized_pnl),0) AS realized"
         " FROM positions p LEFT JOIN marks m ON m.token_id = p.token_id" + where,
+        params,
     ) or {}
     return {
         "rows": rows, "total": total, "page": page, "per_page": limit,
-        "offset": offset, "status": status, "totals": totals,
+        "offset": offset, "status": status, "target": target,
+        "totals": totals,
     }
 
 
 def signals_page(conn: sqlite3.Connection | None, *, copied: str = "",
                  reason: str = "", page: int = 1,
-                 per_page: int = 100) -> dict[str, Any]:
+                 per_page: int = 100, target: str = "") -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
     if copied in ("1", "0"):
@@ -444,6 +457,9 @@ def signals_page(conn: sqlite3.Connection | None, *, copied: str = "",
     if reason:
         where.append("s.reason = ?")
         params.append(reason)
+    if target:
+        where.append("s.target = ?")
+        params.append(target)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     offset, limit = _page_bounds(page, per_page)
     total = int(_scalar(conn, "SELECT COUNT(*) FROM signals s" + clause, params))
@@ -453,7 +469,7 @@ def signals_page(conn: sqlite3.Connection | None, *, copied: str = "",
         " tf.event_slug AS target_event_slug,"
         " tb.avg_buy_price AS target_avg_buy"
         " FROM signals s LEFT JOIN target_fills tf"
-        " ON tf.dedupe_key = s.dedupe_key"
+        " ON tf.dedupe_key = s.dedupe_key AND tf.target = s.target"
         " LEFT JOIN ("
         "   SELECT target, token_id,"
         "          SUM(usd) / NULLIF(SUM(size), 0) AS avg_buy_price"
@@ -465,8 +481,50 @@ def signals_page(conn: sqlite3.Connection | None, *, copied: str = "",
     )
     return {
         "rows": rows, "total": total, "page": page, "per_page": limit,
-        "offset": offset,
+        "offset": offset, "target": target,
     }
+
+
+def active_pending_buys(conn: sqlite3.Connection | None,
+                        target: str | None = None) -> list[dict[str, Any]]:
+    where = ["status IN ('SUBMITTING','PENDING','CANCEL_REQUESTED',"
+             "'TAIL_SUBMITTED')"]
+    params: list[Any] = []
+    if target:
+        where.append("target = ?")
+        params.append(target)
+    return _all(
+        conn,
+        "SELECT * FROM pending_buys WHERE " + " AND ".join(where)
+        + " ORDER BY id",
+        params,
+    )
+
+
+def target_blocking_work(conn: sqlite3.Connection | None,
+                         address: str) -> str | None:
+    """Reason a target cannot be deleted, or None when it is safe."""
+    checks = (
+        ("positions", "SELECT COUNT(*) FROM positions"
+                      " WHERE target = ? AND status = 'OPEN'", "未平仓持仓"),
+        ("pending_buys", "SELECT COUNT(*) FROM pending_buys"
+                         " WHERE target = ? AND status IN"
+                         " ('SUBMITTING','PENDING','CANCEL_REQUESTED',"
+                         "'TAIL_SUBMITTED')", "未完成 maker 挂单"),
+        ("pending_exits", "SELECT COUNT(*) FROM pending_exits"
+                          " WHERE target = ?", "待重试的卖出"),
+        ("manual_sells", "SELECT COUNT(*) FROM manual_sells"
+                         " WHERE target = ? AND status IN"
+                         " ('PENDING','PARTIAL')", "待执行的手动卖出"),
+        ("orders", "SELECT COUNT(*) FROM orders"
+                   " WHERE target = ? AND mode = 'live' AND status IN"
+                   " ('INTENT','PREPARED','SUBMITTED','PARTIAL')",
+         "未完成的实盘订单"),
+    )
+    for _table, sql, label in checks:
+        if int(_scalar(conn, sql, (address,))) > 0:
+            return label
+    return None
 
 
 def signal_summary(conn: sqlite3.Connection | None) -> list[dict[str, Any]]:

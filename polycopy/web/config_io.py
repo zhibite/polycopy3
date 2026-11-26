@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tomllib
 from dataclasses import fields
@@ -11,6 +12,8 @@ from typing import Any
 
 from ..config import (AppConfig, LiveConfig, PaperConfig, RunConfig,
                       TargetConfig)
+
+TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 def _toml_value(value: Any) -> str:
@@ -62,6 +65,10 @@ def dumps_config(cfg: AppConfig) -> str:
 def save_config(cfg: AppConfig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    for name in cfg.targets:
+        if not TARGET_NAME_RE.match(str(name)):
+            raise ValueError(
+                f"target name {name!r} must match [A-Za-z0-9_-]{{1,32}}")
     text = dumps_config(cfg)
     # Validate before touching the live file.
     parsed = tomllib.loads(text)

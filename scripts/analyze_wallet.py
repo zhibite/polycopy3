@@ -159,8 +159,8 @@ def main():
     # ------------------------------------------------------------- all-time
     apnl = stats.get("all_time_pnl") or {}
     print("\n--- ALL-TIME ACCOUNT " + "-" * 61)
-    print(f"  volume (gross)              : {fs(apnl.get('volume') or vol.get('volume'))}   "
-          f"one-side USDC {fs(apnl.get('volume_usdc') or vol.get('volume_usdc'))}")
+    print(f"  volume (shares)             : {fn(apnl.get('volume') or vol.get('volume'), 0)}   "
+          f"one-side USD {fs(apnl.get('volume_usdc') or vol.get('volume_usdc'))}")
     print(f"  trade count (stats/volume)  : {stats.get('trades')} / {apnl.get('trade_count') or vol.get('trade_count')}")
     print(f"  realized market PnL         : {fs(apnl.get('realized_market_pnl'))}")
     print(f"  unrealized PnL (now)        : {fs(apnl.get('unrealized_pnl'))}")
@@ -170,8 +170,10 @@ def main():
     print(f"  fees paid                   : {fs(apnl.get('fees'))}")
     print(f"  economic PnL (all-in)       : {fs(apnl.get('economic_pnl'))}")
     print(f"  biggest single win          : {fs(stats.get('biggest_win'))}")
-    if apnl.get("volume"):
-        print(f"  economic PnL / volume       : {pct((apnl.get('economic_pnl') or 0) / apnl['volume'], 3)}")
+    volume_usd = apnl.get("volume_usdc") or vol.get("volume_usdc")
+    if volume_usd:
+        print(f"  economic PnL / one-side USD : "
+              f"{pct((apnl.get('economic_pnl') or 0) / volume_usd, 3)}")
     for period in ("day", "week", "month", "all"):
         b = (board.get(period) or {}).get("data") or {}
         if b:
@@ -194,13 +196,13 @@ def main():
         by_month = {}
         for p in pts:
             by_month[month(p["timestamp"])] = p
-        print("  monthly economic PnL / volume / trades:")
+        print("  monthly economic PnL / cumulative shares / cumulative trades:")
         prev = None
         for mth in sorted(by_month):
             p = by_month[mth]
             cur = float(p.get("economic_pnl") or 0)
             d_pnl = cur - prev if prev is not None else cur
-            print(f"    {mth}  pnl {fs(d_pnl):>10}   volume {fs(p.get('volume')):>10}   "
+            print(f"    {mth}  pnl {fs(d_pnl):>10}   shares {fn(p.get('volume'), 0):>13}   "
                   f"trades {p.get('trade_count')}")
             prev = cur
 

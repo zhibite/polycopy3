@@ -19,23 +19,48 @@
   {% elif restart_requested %}
     <div class="alert ok">配置已保存。重启请求已提交，bot 将在几秒内重启并加载新配置。</div>
   {% elif mode_changed %}
-    <div class="alert warn">配置已保存。运行模式或实盘设置已变更，需要重启 bot 才会生效；重启前仍按旧模式运行。</div>
+    <div class="alert warn">配置已保存。运行模式、实盘设置或地址列表已变更，需要重启 bot 才会生效；重启前仍按旧配置运行。</div>
   {% else %}
     <div class="alert ok">配置已保存。策略参数将在约 {{ cfg.paper.poll_seconds }} 秒内自动生效。</div>
   {% endif %}
 {% endif %}
+{% if targets_changed %}
+  <div class="alert warn">
+    跟单地址列表已变化：链上订阅在 bot 启动时固定，新增/删除地址需要重启后才会生效。
+    如果重启请求未自动提交，请点击「保存并重启 bot」。
+  </div>
+{% endif %}
+{% if delete_error %}
+  <div class="alert warn">删除失败：{{ delete_error }}</div>
+{% endif %}
 {% if error %}
   <div class="alert warn">保存失败：{{ error }}</div>
 {% endif %}
+{% if pending_buys %}
+  <div class="alert warn">
+    当前有 <b>{{ pending_buys|length }}</b> 个未完成的实盘 maker 挂单。
+    切换 paper / dry-run 前请先在实盘处理完这些挂单，否则新进程无法撤单。
+  </div>
+{% endif %}
 
 <div class="alert info">
-  这里只调整跟单策略参数。数据库路径、日志路径、目标钱包地址不在此页修改。
-  带 <b>热加载</b> 的字段保存后由引擎自动读取；账户初始资金只在建库时生效，之后不可更改。
-  运行模式、dry-run、实盘上限与密钥变量名属于重启项。
+  每个跟单地址独立一套参数。地址可以在此页新增；现有地址如需更换请删除后新增。
+  <b>热加载</b> 字段保存后由引擎自动读取；运行模式、dry-run、实盘上限、密钥变量名
+  以及地址列表变更需要重启 bot。账户初始资金只在建库时生效。
+</div>
+
+<div class="tabs">
+  {% for name, t in cfg.targets.items() %}
+    <a href="/config?target={{ name }}" class="{{ 'active' if (not is_new and name == target_key) else '' }}">
+      {{ name }} · {{ t.address|short_addr }}{% if not t.enabled %} · 停用{% endif %}
+    </a>
+  {% endfor %}
+  <a href="/config?target=__new__" class="{{ 'active' if is_new else '' }}">+ 新增地址</a>
 </div>
 
 <form method="post" action="/config">
   <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="target_key" value="{{ target_key }}">
 
 <div class="config-group">
   <h2><span class="dot"></span>运行模式</h2>
@@ -151,17 +176,34 @@
 </div>
 
   <div class="config-group">
-    <h2><span class="dot"></span>账户与目标钱包</h2>
+    <h2><span class="dot"></span>账户与跟单地址</h2>
     <div class="config-grid">
       <div class="field">
         <label>账户初始资金</label>
         <input type="text" value="{{ cfg.account.starting_cash|money }}" readonly>
-        <div class="help">建库时写入，修改不会影响现有账户。</div>
+        <div class="help">建库时写入，修改不会影响现有账户。多个地址共用一个账户。</div>
+      </div>
+      <div class="field">
+        <label>跟单地址名称{% if is_new %}（新地址）{% endif %}</label>
+        {% if is_new %}
+          <input type="text" name="new_target_name" value="{{ new_target_name|default('') }}"
+                 placeholder="例如 f705、alice" required>
+          <div class="help">只能包含字母、数字、_、-，长度 1–32；用作配置文件名。</div>
+        {% else %}
+          <input type="text" value="{{ target_key }}" readonly>
+          <div class="help">名称是 TOML 配置中的 key，不支持在此修改。</div>
+        {% endif %}
       </div>
       <div class="field">
         <label>目标钱包地址</label>
-        <input type="text" value="{{ target.address }}" readonly>
-        <div class="help">如需更换目标，请直接编辑配置文件后重新部署。</div>
+        {% if is_new %}
+          <input type="text" name="target.address" value="{{ target.address }}"
+                 placeholder="0x..." required>
+          <div class="help">填 Polymarket 代理钱包地址（data-api 的 proxy_wallet），不是签名 EOA。</div>
+        {% else %}
+          <input type="text" value="{{ target.address }}" readonly>
+          <div class="help">现有地址不可在此修改；如需更换请删除后新增。</div>
+        {% endif %}
       </div>
       <div class="field">
         <label>启用该目标</label>
@@ -169,7 +211,7 @@
           <input type="checkbox" name="target.enabled" value="1" {{ 'checked' if target.enabled else '' }}>
           <span class="key">target.enabled</span>
         </div>
-        <div class="help">关闭后不再轮询该钱包。</div>
+        <div class="help">关闭后不再跟新买入/跟卖；已有仓位仍会被止盈止损和强平逻辑管理。</div>
       </div>
       <div class="field">
         <label>仓位模式</label>
@@ -179,6 +221,17 @@
         </select>
         <div class="help">scale：我们的金额 = 目标金额 × 跟单比例；fixed：每笔固定金额。</div>
       </div>
+      {% if not is_new and cfg.targets|length > 1 %}
+        <div class="field">
+          <label>删除该跟单地址</label>
+          <button class="btn btn-ghost btn-sm" type="submit"
+                  formaction="/config/target/delete" formnovalidate
+                  onclick="return confirm('删除该跟单地址？有未平仓仓位、挂单或待执行卖出时会被拒绝。')">
+            删除 {{ target_key }}
+          </button>
+          <div class="help">有未平仓仓位、未完成 maker 挂单、待执行卖出或实盘订单时不能删除。</div>
+        </div>
+      {% endif %}
     </div>
   </div>
 
@@ -232,12 +285,57 @@
         <label>单市场最大敞口（USD）</label>
         <input type="number" step="1" min="0" name="target.max_market_usd"
                value="{{ target.max_market_usd }}">
-        <div class="help">同一 condition_id 下所有持仓的成本上限。</div>
+        <div class="help">该跟单地址在同一 condition_id 下的持仓成本上限（含挂单中未成交部分）。</div>
       </div>
       <div class="field">
         <label>最大同时持仓数</label>
         <input type="number" step="1" min="1" max="10000" name="target.max_open_positions"
                value="{{ target.max_open_positions }}">
+        <div class="help">该跟单地址的最大同时持仓数（含挂单中的 token）。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>到期过滤、实盘 Maker 与止盈止损</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>距结算最少小时数</label>
+        <input type="number" step="0.5" min="0" max="168"
+               name="target.min_hours_to_end" value="{{ target.min_hours_to_end }}">
+        <div class="help">0 = 不检查；例如 2 表示距市场结束不足 2 小时的目标买入不跟。无法获取结束时间时跳过。</div>
+      </div>
+      <div class="field">
+        <label>实盘 maker 挂单入场</label>
+        <div class="switch-row">
+          <input type="checkbox" name="target.maker_entry_enabled" value="1" {{ 'checked' if target.maker_entry_enabled else '' }}>
+          <span class="key">target.maker_entry_enabled</span>
+        </div>
+        <div class="help">仅实盘非 dry-run 生效：按目标成交价挂 GTC；纸盘仍直接 FAK 模拟。</div>
+      </div>
+      <div class="field">
+        <label>maker 挂单超时（秒）</label>
+        <input type="number" step="1" min="1" max="86400"
+               name="target.maker_timeout_seconds" value="{{ target.maker_timeout_seconds }}">
+        <div class="help">超时后撤单，未成交剩余用 FAK 补单。</div>
+      </div>
+      <div class="field">
+        <label>FAK 补单最高溢价（比例）</label>
+        <input type="number" step="any" min="0" max="0.5"
+               name="target.fak_max_premium_pct" value="{{ target.fak_max_premium_pct }}">
+        <div class="help">0.02 = 补单价格不超过目标价 × 1.02。</div>
+      </div>
+      <div class="field">
+        <label>止盈比例（相对入场均价）</label>
+        <input type="number" step="any" min="0" max="1"
+               name="target.take_profit_pct" value="{{ target.take_profit_pct }}">
+        <div class="help">0.10 = +10%；0 = 关闭。用中间价触发，触发后立即 strict FAK 卖出。</div>
+      </div>
+      <div class="field">
+        <label>止损比例（相对入场均价）</label>
+        <input type="number" step="any" min="0" max="1"
+               name="target.stop_loss_pct" value="{{ target.stop_loss_pct }}">
+        <div class="help">0.20 = −20%；0 = 关闭。目标尚未卖出时才由本规则退出。</div>
       </div>
     </div>
   </div>
@@ -353,6 +451,18 @@
                value="{{ cfg.paper.mark_every_seconds }}">
       </div>
       <div class="field">
+        <label>止盈止损检查间隔（秒）</label>
+        <input type="number" step="1" min="5" max="86400" name="paper.risk_check_seconds"
+               value="{{ cfg.paper.risk_check_seconds }}">
+        <div class="help">批量取中间价检查所有开启止盈止损的持仓；建议 15–60 秒。</div>
+      </div>
+      <div class="field">
+        <label>新仓位保护期（秒）</label>
+        <input type="number" step="any" min="0" max="3600" name="paper.orphan_grace_seconds"
+               value="{{ cfg.paper.orphan_grace_seconds }}">
+        <div class="help">刚买入的仓位在该时间内不被「目标已清仓」强平，避免 data-api 对账延迟造成误卖；0 = 关闭。</div>
+      </div>
+      <div class="field">
         <label>活动接口最大分页数</label>
         <input type="number" step="1" min="1" max="50" name="paper.max_pages"
                value="{{ cfg.paper.max_pages }}">
@@ -366,7 +476,10 @@
   </div>
 
   <div class="save-bar">
-    <span class="save-msg">保存后约 {{ cfg.paper.poll_seconds }} 秒内生效 · 修改前会自动备份为 .bak · 「保存并重启」会短暂中断监控</span>
+    <span class="save-msg">
+      策略参数热加载 · 地址列表 / 运行模式 / live 设置变更需重启 · 修改前自动备份 .bak
+      · 「保存并重启」会短暂中断监控
+    </span>
     <a href="/config" class="btn btn-ghost" style="text-decoration:none;display:inline-block;padding:9px 16px;border-radius:7px">放弃修改</a>
     <button class="btn btn-ghost" type="submit" name="restart" value="1">保存并重启 bot</button>
     <button class="btn btn-primary" type="submit">保存配置</button>

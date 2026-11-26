@@ -3,15 +3,12 @@
 {% block head %}<meta http-equiv="refresh" content="30">{% endblock %}
 {% block content %}
 
-{% set first_target = (cfg.targets.values()|list|first) if cfg and cfg.targets else None %}
-
 <div class="page-head">
   <div>
     <h1>控制台</h1>
     <div class="page-sub">
-      {% if first_target %}
-        跟单 {{ first_target.address|short_addr }} · 买入价
-        {{ '%.2f'|format(first_target.buy_price_min) }}–{{ '%.2f'|format(first_target.buy_price_max) }}
+      {% if cfg and cfg.targets %}
+        跟单 {{ cfg.targets|length }} 个地址 · 每个地址独立参数（见策略配置）
       {% else %}
         纸盘跟单总览
       {% endif %}
@@ -232,6 +229,10 @@
               买入 {{ '%.2f'|format(t.buy_price_min) }}–{{ '%.2f'|format(t.buy_price_max) }} ·
               {{ '固定 $' ~ t.fixed_notional_usd if t.sizing_mode == 'fixed' else '跟单 ' ~ (t.scale_factor * 100)|round(2) ~ '%' }}
               · 单市场上限 {{ t.max_market_usd|money }}
+              {% if t.min_hours_to_end %} · 距结算 ≥ {{ t.min_hours_to_end }}h{% endif %}
+              {% if t.take_profit_pct or t.stop_loss_pct %}
+                · TP {{ (t.take_profit_pct * 100)|round(0) }}% / SL {{ (t.stop_loss_pct * 100)|round(0) }}%
+              {% endif %}
             </td>
           </tr>
         {% else %}

@@ -32,14 +32,11 @@
     <div class="stat-sub">原因见下表</div>
   </div>
   <div class="stat-card">
-    <div class="stat-label">当前配置</div>
+    <div class="stat-label">跟单地址</div>
     <div class="stat-value" style="font-size:17px">
-      {% if cfg and cfg.targets %}
-        {% set t = cfg.targets.values()|list|first %}
-        {{ '%.2f'|format(t.buy_price_min) }}–{{ '%.2f'|format(t.buy_price_max) }}
-      {% else %}--{% endif %}
+      {% if cfg and cfg.targets %}{{ cfg.targets|length }} 个{% else %}--{% endif %}
     </div>
-    <div class="stat-sub">买入价格区间</div>
+    <div class="stat-sub">每个地址独立参数</div>
   </div>
 </div>
 
@@ -70,11 +67,21 @@
 </div>
 
 <form class="filters" method="get" action="/signals">
+  <label>跟单地址
+    <select name="target">
+      <option value="" {{ 'selected' if filters.target == '' else '' }}>全部</option>
+      {% for name, t in (cfg.targets.items() if cfg else []) %}
+        <option value="{{ t.address }}" {{ 'selected' if filters.target == t.address else '' }}>
+          {{ name }} · {{ t.address|short_addr }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
   <label>结果
     <select name="copied">
       <option value="" {{ 'selected' if filters.copied == '' else '' }}>全部</option>
       <option value="1" {{ 'selected' if filters.copied == '1' else '' }}>已跟单</option>
-      <option value="0" {{ 'selected' if filters.copied == '0' else '' }}>已跳过</option>
+      <option value="0" {{ 'selected' if filters.copied == '0' else '' }}>未成交/跳过</option>
     </select>
   </label>
   <label>跳过原因（精确匹配，可留空）
@@ -90,7 +97,7 @@
     <table>
       <thead>
         <tr>
-          <th>时间</th><th>方向</th><th>市场</th><th>结果</th><th>信号价</th>
+          <th>时间</th><th>跟单地址</th><th>方向</th><th>市场</th><th>结果</th><th>信号价</th>
           <th title="该结果 token 的当前中间价（无盘口时用最近成交价），每 2 秒刷新">当前价</th>
           <th>信号金额</th><th>状态</th><th>延迟</th>
           <th>我方价格</th><th>我方数量</th><th>我方金额</th>
@@ -100,6 +107,10 @@
         {% for s in data.rows %}
           <tr>
             <td class="mono nowrap">{{ s.ts|dt_bj }}</td>
+            <td class="mono muted" title="{{ s.target }}">
+              {% set tname = target_names.get((s.target or '')|lower) %}
+              {{ tname if tname else (s.target|short_addr) }}
+            </td>
             <td><span class="pill {{ 'buy' if s.side == 'BUY' else 'sell' }}">{{ '买入' if s.side == 'BUY' else '卖出' }}</span></td>
             <td title="{{ s.title }}">
               {% if s.event_slug or s.slug or s.market_slug %}
@@ -111,12 +122,14 @@
             <td>{{ s.outcome or '--' }}</td>
             <td class="mono">{{ s.price|price }}</td>
             <td class="mono live-price" data-token="{{ s.token_id }}"
-                data-entry="{{ s.price if s.side == 'BUY' else (s.target_avg_buy or '') }}"
-                title="当前价为中间价（无盘口时用最近成交价）；盈亏% = 当前价 / 买入价 - 1，买入信号用本笔信号价，卖出信号用跟单地址记录买入均价"><span class="px">--</span><span class="pnl"></span></td>
+                data-entry="{{ (s.our_price if s.our_price is not none else s.price) if s.side == 'BUY' else (s.target_avg_buy or '') }}"
+                title="当前价为中间价（无盘口时用最近成交价）；盈亏% = 当前价 / 买入价 - 1，买入信号优先用我方实际成交价，卖出信号用跟单地址记录买入均价"><span class="px">--</span><span class="pnl"></span></td>
             <td class="mono">{{ s.usd|money }}</td>
             <td>
               {% if s.copied %}
                 <span class="pill ok">已跟单</span>
+              {% elif s.reason == 'maker_pending' %}
+                <span class="pill warn" title="按目标价挂单中；超时后撤单并用 FAK 补剩余">挂单中</span>
               {% else %}
                 {% set skip_reason = (s.reason|reason_cn) if s.reason else '未知原因' %}
                 <span class="pill idle" title="{{ skip_reason }}{% if s.reason and skip_reason != s.reason %} · {{ s.reason }}{% endif %}">已跳过</span>
@@ -128,14 +141,14 @@
             <td class="mono">{{ s.our_notional|money if s.our_notional is not none else '--' }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="12" class="no-data">暂无信号</td></tr>
+          <tr><td colspan="13" class="no-data">暂无信号</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 
   {% set pages = (((data.total - 1) // data.per_page) + 1) if data.total > 0 else 1 %}
-  {% set qs = 'copied=' ~ filters.copied ~ '&reason=' ~ filters.reason %}
+  {% set qs = 'copied=' ~ filters.copied ~ '&reason=' ~ filters.reason ~ '&target=' ~ filters.target %}
   <div class="pager">
     {% if data.page > 1 %}
       <a href="/signals?{{ qs }}&page={{ data.page - 1 }}">上一页</a>

@@ -4,12 +4,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from . import broker, rules
 from .api import ClobApi, DataApi, GammaApi
 from .config import AppConfig, TargetConfig, load_config
-from .execution import Executor, PaperExecutor, TradeIntent
+from .execution import ExecutionResult, Executor, PaperExecutor, TradeIntent
 from .store import Store
 
 
@@ -30,10 +31,18 @@ class Engine:
         self._last_mark = 0
         self._last_target_reconcile = 0
         self._last_balance_sync = 0
+        self._last_risk_check = 0
+        self._last_exit_retry = 0
         self._market_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._end_ts_cache: dict[str, tuple[float, int | None]] = {}
         self._token_cache: dict[str, tuple[float, list[str]]] = {}
         self._cycles = 0
         self._cfg_mtime: float | None = None
+        self._target_ledger_ok = False
+        self._pending_gateway_warned = False
+        # Tails are suppressed until the on-chain feed has caught up and the
+        # target position ledger has been reconciled (set by OnchainRunner).
+        self.allow_tail_entries = True
 
     def maybe_reload_config(self) -> None:
         """Pick up edits made in the web dashboard without a restart."""
@@ -81,10 +90,40 @@ class Engine:
                 self.process_target(name, target)
             except Exception:
                 self.log.exception("target %s failed", name)
+        self.trading_tick()
         self.maintenance()
 
+    def trading_tick(self) -> None:
+        """All executor-owning work; called only from the trading thread.
+
+        Keeping maker polls, manual sells, risk exits and exit retries in one
+        thread avoids two SQLite connections/sell paths racing on a position.
+        """
+        now = int(time.time())
+        try:
+            self.process_pending_buys()
+        except Exception:
+            self.log.exception("pending buy processing failed")
+        try:
+            self.process_manual_sells()
+        except Exception:
+            self.log.exception("manual sell processing failed")
+        if now - self._last_risk_check >= self.cfg.paper.risk_check_seconds:
+            try:
+                self.check_risk_exits()
+            except Exception:
+                self.log.exception("risk exit check failed")
+            self._last_risk_check = now
+        if now - self._last_exit_retry >= 5:
+            try:
+                self.retry_pending_exits()
+            except Exception:
+                self.log.exception("pending exit retry failed")
+            self._last_exit_retry = now
+        self.store.commit()
+
     def maintenance(self) -> None:
-        """Settlement, marks and heartbeat; safe to call from any source loop."""
+        """Read-only/reconcile work; safe to call from a background thread."""
         now = int(time.time())
         if now - self._last_target_reconcile >= self.cfg.paper.target_reconcile_seconds:
             try:
@@ -96,14 +135,6 @@ class Engine:
             self.reconcile_orphan_positions()
         except Exception:
             self.log.exception("orphan reconciliation failed")
-        try:
-            self.process_manual_sells()
-        except Exception:
-            self.log.exception("manual sell processing failed")
-        try:
-            self.retry_pending_exits()
-        except Exception:
-            self.log.exception("pending exit retry failed")
 
         if now - self._last_settle >= self.cfg.paper.settle_every_seconds:
             try:
@@ -216,6 +247,11 @@ class Engine:
                 before = self.store.target_shares(target.address, token)
                 frac = min(1.0, size / before) if before > 1e-9 else 0.0
                 self.store.add_target_shares(target.address, cond, token, -size)
+                # Apply/cancel any resting maker buy before computing our
+                # copy-sell basis, otherwise the fraction is computed from too
+                # few shares and the late fill leaves us overexposed.
+                self._cancel_pending_for_token(
+                    target, cond, token, "target_sell", frac)
                 if not target.copy_sells:
                     self._skip(target, row, "sells_disabled", source=source)
                 elif frac <= 0:
@@ -227,6 +263,8 @@ class Engine:
                 self._copy_buy(name, target, row, source=source)
         elif kind == "REDEEM":
             self.store.set_target_shares(target.address, token, 0.0)
+            self.store.request_cancel_pending_buys_for_condition(
+                target.address, cond, "redeem", ts=int(time.time()))
         elif kind in ("SPLIT", "MERGE"):
             tokens = self._condition_tokens(cond)
             if not tokens:
@@ -234,6 +272,8 @@ class Engine:
             delta = size if kind == "SPLIT" else -size
             for tok in tokens:
                 self.store.add_target_shares(target.address, cond, tok, delta)
+            self.store.request_cancel_pending_buys_for_condition(
+                target.address, cond, kind.lower(), ts=int(time.time()))
 
     # --------------------------------------------------------------- copy buys
     def _copy_buy(self, name: str, target: TargetConfig,
@@ -246,13 +286,19 @@ class Engine:
 
         existing = self.store.position(target.address, cond, token)
         has_position = bool(existing and existing.get("status") == "OPEN")
-        market_usd = self.store.market_exposure(cond)
-        open_positions = self.store.count_open_positions()
+        market_usd = (self.store.market_exposure(cond, target.address)
+                      + self.store.pending_buy_commitment(
+                          target=target.address, condition_id=cond))
+        open_positions = (self.store.count_open_positions(target.address)
+                          + self.store.count_pending_buy_tokens(target.address))
+        end_ts = (self._end_ts_for(row, cond)
+                  if target.min_hours_to_end > 0 else None)
         reason = rules.buy_skip_reason(
             target, row, now=now,
             stale_seconds=self.cfg.paper.stale_signal_seconds,
             open_positions=open_positions,
             has_position=has_position, market_usd=market_usd,
+            end_ts=end_ts,
         )
         if reason:
             self._skip(target, row, reason, source=source)
@@ -260,8 +306,13 @@ class Engine:
 
         account = self.store.account()
         ledger_cash = float(account["cash"])
-        cash = float(self.executor.available_cash(ledger_cash))
-        available = max(0.0, cash * (1.0 - self.cfg.paper.cash_reserve_pct))
+        cash = float(self.executor.available_cash(
+            ledger_cash, store=self.store))
+        available = max(
+            0.0,
+            cash * (1.0 - self.cfg.paper.cash_reserve_pct)
+            - self.store.pending_buy_commitment(),
+        )
         remaining_market = max(0.0, target.max_market_usd - market_usd)
         budget = min(rules.desired_notional(target, usd), remaining_market, available)
 
@@ -300,7 +351,13 @@ class Engine:
             max_spend=available, max_market=remaining_market,
             min_notional=target.min_notional_usd, source=source,
         )
-        result = self.executor.buy(intent)
+        if (self.executor.is_live and target.maker_entry_enabled
+                and not getattr(self.executor, "dry_run", False)):
+            self._copy_buy_maker(
+                name, target, row, intent, source=source, end_ts=end_ts)
+            return
+
+        result = self.executor.buy(intent, store=self.store)
         if not result.fills:
             reason = result.reason or "no_fill"
             if result.status == "dry_run":
@@ -349,6 +406,104 @@ class Engine:
                 (avg_price - signal_price) * 100.0,
                 open_positions, market_usd, cash, title,
             )
+
+    # ------------------------------------------------------- live maker entry
+    def _copy_buy_maker(self, name: str, target: TargetConfig,
+                        row: dict[str, Any], intent: TradeIntent, *,
+                        source: str, end_ts: int | None) -> None:
+        """Create a pending row, place a GTC buy, and record maker_pending."""
+        now = int(time.time())
+        signal_key = rules.dedupe_key(row)
+        signal_ts = int(row.get("timestamp") or 0)
+        maker_key = intent.dedupe_key + ":maker"
+        maker_intent = replace(
+            intent, dedupe_key=maker_key, limit_price=intent.signal_price)
+        pending_id = self.store.create_pending_buy(
+            signal_key=signal_key, target=target.address,
+            condition_id=intent.condition_id, token_id=intent.token_id,
+            outcome=intent.outcome, title=intent.title,
+            event_slug=intent.event_slug, slug=str(row.get("slug") or ""),
+            signal_price=intent.signal_price,
+            limit_price=intent.signal_price, fee_rate=intent.fee_rate,
+            shares=intent.shares,
+            target_shares_at_entry=self.store.target_shares(
+                target.address, intent.token_id),
+            end_ts=int(end_ts or 0),
+            deadline_ts=now + int(target.maker_timeout_seconds) + 120,
+            signal_ts=signal_ts, source=source,
+        )
+        self._record_signal(
+            target, row, copied=False, reason="maker_pending", source=source)
+        self.store.commit()
+        try:
+            result = self.executor.start_maker_buy(
+                maker_intent, store=self.store, pending_id=pending_id)
+        except Exception:
+            self.log.exception("maker entry failed target=%s", name)
+            result = ExecutionResult(status="rejected", reason="submit_error")
+        order = self.store.order_for(
+            maker_key, "BUY", "live", target=target.address)
+        if order is not None:
+            self.store.update_pending_buy(
+                pending_id, order_id=int(order["id"]),
+                shares=float(order.get("size") or intent.shares),
+                limit_price=float(order.get("limit_price")
+                                  or maker_intent.limit_price),
+                deadline_ts=now + int(target.maker_timeout_seconds),
+            )
+            self.store.commit()
+        totals = self._refresh_pending_totals(pending_id)
+        pending = self.store.pending_buy(pending_id)
+        if pending is None:
+            return
+        if result.status == "dry_run":
+            self._finish_pending_buy(pending, "FAILED", "dry_run", now)
+        elif result.status in ("rejected", "no_fill", "canceled"):
+            reason = result.reason or result.status
+            order_status = str(order.get("status") or "") if order else ""
+            filled = float(totals["filled"])
+            if (reason == "duplicate_order"
+                    and order_status in ("SUBMITTED", "PARTIAL", "FILLED")):
+                if order_status == "FILLED":
+                    self._finish_pending_buy(pending, "DONE", "filled", now)
+                else:
+                    self.store.update_pending_buy(
+                        pending_id, status="PENDING", reason=None,
+                        deadline_ts=now + int(target.maker_timeout_seconds))
+                    self.store.commit()
+            elif order_status in ("CANCELED", "REJECTED"):
+                self._finish_pending_buy(
+                    pending, "DONE" if filled > 0 else "FAILED",
+                    "maker_canceled" if order_status == "CANCELED"
+                    else "maker_rejected", now)
+            elif order_status in ("SUBMITTED", "PARTIAL"):
+                self.store.update_pending_buy(
+                    pending_id, status="PENDING", reason=None,
+                    deadline_ts=now + int(target.maker_timeout_seconds))
+                self.store.commit()
+            else:
+                self._finish_pending_buy(pending, "FAILED", reason, now)
+        else:
+            remaining = max(
+                0.0, float(pending["shares"]) - float(totals["filled"]))
+            if remaining <= 1e-9:
+                self._finish_pending_buy(pending, "DONE", "filled", now)
+            else:
+                self.store.update_pending_buy(
+                    pending_id, status="PENDING", reason=None,
+                    deadline_ts=now + int(target.maker_timeout_seconds))
+                self.store.commit()
+        pending = self.store.pending_buy(pending_id) or pending
+        self.log.warning(
+            "MAKER ENTRY %-8s px=%.4f sh=%.2f filled=%.2f deadline=%s "
+            "status=%s order=%s %s",
+            name, float(pending.get("limit_price") or 0.0),
+            float(pending.get("shares") or 0.0),
+            float(pending.get("filled_shares") or 0.0),
+            _dt(int(pending.get("deadline_ts") or 0)),
+            pending.get("status"), pending.get("order_id"),
+            str(row.get("title") or "")[:50],
+        )
 
     # -------------------------------------------------------------- copy sells
     def _copy_sell(self, name: str, target: TargetConfig,
@@ -407,7 +562,7 @@ class Engine:
             signal_price=signal_price, fee_rate=fee_rate,
             strict=strict, source=source,
         )
-        result = self.executor.sell(intent)
+        result = self.executor.sell(intent, store=self.store)
         if not result.fills:
             if result.status == "dry_run":
                 self._skip(target, row, "dry_run", source=source)
@@ -556,7 +711,7 @@ class Engine:
                 signal_price=0.0, fee_rate=fee_rate, strict=True,
                 source="manual_sell",
             )
-            result = self.executor.sell(intent)
+            result = self.executor.sell(intent, store=self.store)
             if not result.fills:
                 if result.status == "dry_run":
                     self.store.update_manual_sell(
@@ -655,6 +810,9 @@ class Engine:
                 self.store.delete_pending_exit(pending["id"])
                 continue
             attempts = int(pending["attempts"]) + 1
+            entry_kind = str(pending.get("kind") or "COPY")
+            is_risk = entry_kind == "RISK"
+            reason = str(pending.get("reason") or "strict_exit")
             intent = TradeIntent(
                 dedupe_key=f"pending:{pending['id']}:{attempts}",
                 target=target.address, condition_id=cond, token_id=token,
@@ -663,9 +821,10 @@ class Engine:
                 event_slug=str(pos.get("event_slug") or ""),
                 side="SELL", shares=shares, limit_price=0.001,
                 signal_price=0.0, fee_rate=self._fee_rate(target),
-                strict=True, source="strict_exit",
+                strict=True,
+                source="risk_exit" if is_risk else "strict_exit",
             )
-            result = self.executor.sell(intent)
+            result = self.executor.sell(intent, store=self.store)
             if not result.fills:
                 if result.status == "dry_run":
                     continue
@@ -681,7 +840,9 @@ class Engine:
                     condition_id=cond, token_id=token,
                     outcome=str(pending.get("outcome") or ""),
                     shares=fill.shares, price=fill.price, fee=fill.fee,
-                    note="strict_exit", order_id=fill.order_id,
+                    note=(reason if is_risk else "strict_exit"),
+                    order_id=fill.order_id,
+                    kind="RISK" if is_risk else "COPY",
                 ) or applied
             if applied is None:
                 self.store.delete_pending_exit(pending["id"])
@@ -698,15 +859,614 @@ class Engine:
             avg = (result.notional / result.filled_shares
                    if result.filled_shares else 0.0)
             self.log.info(
-                "STRICT EXIT %-8s px=%.4f sh=%.3f $=%.2f fee=%.4f "
+                "%s EXIT %-8s px=%.4f sh=%.3f $=%.2f fee=%.4f "
                 "remaining=%.4f mode=%s %s",
+                "RISK" if is_risk else "STRICT",
                 target.address[:10], avg, result.filled_shares,
                 result.notional, result.fee, max(0.0, remaining),
-                "live" if self.executor.is_live else "paper",
-                str(pending.get("reason") or ""),
+                "live" if self.executor.is_live else "paper", reason,
             )
         self.store.commit()
         return filled
+
+    # ------------------------------------------------------------ maker entry
+    def _target_for(self, address: str) -> TargetConfig | None:
+        wanted = str(address or "").lower()
+        return next(
+            (t for t in self.cfg.targets.values()
+             if t.address.lower() == wanted), None)
+
+    def _available_cash(self) -> float:
+        account = self.store.account()
+        cash = float(self.executor.available_cash(
+            float(account["cash"]), store=self.store))
+        return max(
+            0.0,
+            cash * (1.0 - self.cfg.paper.cash_reserve_pct)
+            - self.store.pending_buy_commitment(),
+        )
+
+    def _end_ts_for(self, row: dict[str, Any],
+                    condition_id: str) -> int | None:
+        stamp = rules.parse_ts(row.get("end_ts"))
+        if stamp is not None:
+            return stamp
+        now = time.time()
+        cached = self._end_ts_cache.get(condition_id)
+        if cached and now - cached[0] < 300:
+            return cached[1]
+        stamp = rules.market_end_ts(self._market(condition_id))
+        self._end_ts_cache[condition_id] = (now, stamp)
+        return stamp
+
+    def _refresh_pending_totals(self, pending_id: int, *,
+                                terminal_reason: str | None = None
+                                ) -> dict[str, Any]:
+        pending = self.store.pending_buy(int(pending_id))
+        empty = {"filled": 0.0, "notional": 0.0, "fee": 0.0, "pending": pending}
+        if pending is None:
+            return empty
+        order_ids = [
+            int(value) for value in
+            (pending.get("order_id"), pending.get("fak_order_id"))
+            if value
+        ]
+        if self.executor.is_live:
+            for order_id in order_ids:
+                try:
+                    self.executor.refresh_order(order_id, store=self.store)
+                except Exception:
+                    self.log.exception(
+                        "pending order refresh failed id=%s", order_id)
+        filled = notional = fee = 0.0
+        for order_id in order_ids:
+            shares, value, costs = self.store.fill_totals_for_order(order_id)
+            filled += shares
+            notional += value
+            fee += costs
+        pending = self.store.pending_buy(int(pending_id)) or pending
+        self.store.update_pending_buy(
+            pending_id, filled_shares=filled, notional=notional, fee=fee)
+        if filled > 1e-9:
+            self.store.update_signal_result(
+                pending["target"], pending["signal_key"], copied=True,
+                reason=None, our_shares=filled,
+                our_price=(notional / filled if filled else None),
+                our_notional=notional, our_fee=fee,
+            )
+        elif terminal_reason is not None:
+            self.store.update_signal_result(
+                pending["target"], pending["signal_key"], copied=False,
+                reason=terminal_reason,
+            )
+        self.store.commit()
+        return {
+            "filled": filled, "notional": notional, "fee": fee,
+            "pending": self.store.pending_buy(int(pending_id)) or pending,
+        }
+
+    def _finish_pending_buy(self, pending: dict[str, Any], status: str,
+                            reason: str, now: int) -> None:
+        if not pending:
+            return
+        pending_id = int(pending["id"])
+        self.store.update_pending_buy(
+            pending_id, status=status, reason=reason,
+            attempts=int(pending.get("attempts") or 0) + 1, ts=now,
+        )
+        self._refresh_pending_totals(pending_id, terminal_reason=reason)
+        self.log.warning(
+            "PENDING BUY %-8s id=%s status=%s reason=%s filled=%.4f/%.4f",
+            str(pending.get("target") or "")[:10], pending_id, status, reason,
+            float(pending.get("filled_shares") or 0.0),
+            float(pending.get("shares") or 0.0),
+        )
+
+    def _request_cancel(self, pending: dict[str, Any], reason: str,
+                        now: int, *, target_sold_fraction: float | None = None
+                        ) -> None:
+        if str(pending.get("status")) not in ("SUBMITTING", "PENDING"):
+            return
+        self.store.request_cancel_pending_buys(
+            str(pending["target"]), str(pending["condition_id"]),
+            str(pending["token_id"]), reason, ts=now,
+            target_sold_fraction=target_sold_fraction,
+        )
+        if pending.get("order_id"):
+            try:
+                self.executor.cancel_entry(
+                    int(pending["order_id"]), store=self.store)
+            except Exception:
+                self.log.exception(
+                    "immediate cancel failed pending=%s", pending["id"])
+            self._refresh_pending_totals(int(pending["id"]))
+        self.store.commit()
+
+    def _cancel_pending_for_token(self, target: TargetConfig,
+                                  condition_id: str, token_id: str,
+                                  reason: str,
+                                  fraction: float | None = None) -> int:
+        rows = self.store.active_pending_buys(
+            target.address, condition_id, token_id)
+        if not rows:
+            return 0
+        now = int(time.time())
+        self.store.request_cancel_pending_buys(
+            target.address, condition_id, token_id, reason, ts=now,
+            target_sold_fraction=fraction,
+        )
+        for row in rows:
+            if row.get("order_id"):
+                try:
+                    self.executor.cancel_entry(
+                        int(row["order_id"]), store=self.store)
+                except Exception:
+                    self.log.exception(
+                        "cancel pending failed id=%s", row["id"])
+            self._refresh_pending_totals(int(row["id"]))
+        self.store.commit()
+        return len(rows)
+
+    def process_pending_buys(self) -> int:
+        if not self.executor.is_live:
+            return 0
+        if getattr(self.executor, "gateway", None) is None:
+            active = self.store.pending_buys(
+                ("SUBMITTING", "PENDING", "CANCEL_REQUESTED",
+                 "TAIL_SUBMITTED"))
+            if active and not self._pending_gateway_warned:
+                self.log.critical(
+                    "%d live pending buys exist but no live gateway is"
+                    " configured; manual check required", len(active))
+                self._pending_gateway_warned = True
+            return 0
+        now = int(time.time())
+        processed = 0
+        for pending in self.store.pending_buys(
+                ("SUBMITTING", "PENDING", "CANCEL_REQUESTED",
+                 "TAIL_SUBMITTED")):
+            try:
+                self._process_pending_buy(pending, now)
+            except Exception:
+                self.log.exception(
+                    "pending buy processing failed id=%s", pending["id"])
+            current = self.store.pending_buy(int(pending["id"]))
+            if current and current.get("status") in (
+                    "SUBMITTING", "PENDING", "CANCEL_REQUESTED",
+                    "TAIL_SUBMITTED"):
+                processed += 1
+        self.store.commit()
+        return processed
+
+    def _process_pending_buy(self, pending: dict[str, Any],
+                             now: int) -> None:
+        pending_id = int(pending["id"])
+        target = self._target_for(str(pending["target"]))
+        if (target is None or not target.enabled) and pending.get(
+                "status") in ("SUBMITTING", "PENDING"):
+            self._request_cancel(pending, "target_disabled", now)
+            pending = self.store.pending_buy(pending_id) or pending
+            if pending.get("status") == "CANCEL_REQUESTED":
+                self._cancel_and_maybe_tail(pending, target, now,
+                                            allow_tail=False)
+            return
+        block = self.executor.entry_cancel_reason(store=self.store)
+        if block and pending.get("status") in ("SUBMITTING", "PENDING"):
+            self._request_cancel(pending, block, now)
+            pending = self.store.pending_buy(pending_id) or pending
+            if pending.get("status") == "CANCEL_REQUESTED":
+                self._cancel_and_maybe_tail(pending, target, now,
+                                            allow_tail=False)
+            return
+        if pending.get("status") == "SUBMITTING":
+            if not pending.get("order_id"):
+                if now - int(pending.get("created_at") or 0) < 15:
+                    return
+                order = self.store.order_for(
+                    str(pending["signal_key"]) + ":maker", "BUY", "live",
+                    target=str(pending["target"]))
+                if order is None:
+                    self._finish_pending_buy(
+                        pending, "FAILED", "no_order", now)
+                    return
+                self.store.update_pending_buy(
+                    pending_id, order_id=int(order["id"]),
+                    shares=float(order.get("size") or pending["shares"]),
+                    limit_price=float(order.get("limit_price")
+                                      or pending["limit_price"]),
+                    deadline_ts=(int(order.get("created_at") or now)
+                                 + int(target.maker_timeout_seconds)),
+                    status="PENDING", reason=None,
+                )
+            else:
+                self.store.update_pending_buy(
+                    pending_id, status="PENDING",
+                    deadline_ts=max(
+                        int(pending.get("deadline_ts") or 0),
+                        int(pending.get("created_at") or now)
+                        + int(target.maker_timeout_seconds)),
+                )
+            self.store.commit()
+            pending = self.store.pending_buy(pending_id) or pending
+        market = self._market(str(pending["condition_id"]))
+        if (market and market.get("closed")
+                and pending.get("status") in ("PENDING", "CANCEL_REQUESTED")):
+            self._request_cancel(pending, "market_closed", now)
+            pending = self.store.pending_buy(pending_id) or pending
+            self._cancel_and_maybe_tail(pending, target, now, allow_tail=False)
+            return
+        if pending.get("status") == "TAIL_SUBMITTED":
+            self._process_tail(pending, target, now)
+            return
+        if (pending.get("order_id")
+                and pending.get("status") == "PENDING"
+                and now < int(pending.get("deadline_ts") or 0)
+                and now - int(pending.get("updated_at") or 0) < 2):
+            # Resting order: poll at most every ~2s to spare the data API.
+            return
+        if pending.get("order_id"):
+            self._refresh_pending_totals(pending_id)
+            pending = self.store.pending_buy(pending_id) or pending
+        remaining = max(
+            0.0, float(pending.get("shares") or 0.0)
+            - float(pending.get("filled_shares") or 0.0))
+        if remaining <= 1e-9:
+            self._finish_pending_buy(pending, "DONE", "filled", now)
+            return
+        status = str(pending.get("status") or "")
+        if status == "CANCEL_REQUESTED":
+            self._cancel_and_maybe_tail(
+                pending, target, now,
+                allow_tail=str(pending.get("reason") or "") == "timeout")
+            return
+        if status != "PENDING":
+            return
+        order = (self.store.order(int(pending["order_id"]))
+                 if pending.get("order_id") else None)
+        order_status = str(order.get("status") if order else "")
+        if order_status in ("CANCELED", "REJECTED"):
+            self._finish_pending_buy(
+                pending, "DONE" if float(pending.get("filled_shares") or 0) > 0
+                else "FAILED",
+                "maker_canceled" if order_status == "CANCELED"
+                else "maker_rejected", now)
+            return
+        deadline = int(pending.get("deadline_ts") or 0)
+        if now < deadline:
+            return
+        if now > deadline + 120:
+            self._request_cancel(pending, "tail_expired", now)
+            pending = self.store.pending_buy(pending_id) or pending
+            self._cancel_and_maybe_tail(pending, target, now,
+                                        allow_tail=False)
+            return
+        self._request_cancel(pending, "timeout", now)
+        pending = self.store.pending_buy(pending_id) or pending
+        self._cancel_and_maybe_tail(pending, target, now, allow_tail=True)
+
+    def _cancel_and_maybe_tail(self, pending: dict[str, Any],
+                               target: TargetConfig | None, now: int, *,
+                               allow_tail: bool) -> None:
+        pending_id = int(pending["id"])
+        if pending.get("order_id"):
+            ok = self.executor.cancel_entry(
+                int(pending["order_id"]), store=self.store)
+            self._refresh_pending_totals(pending_id)
+            pending = self.store.pending_buy(pending_id) or pending
+            order = self.store.order(int(pending["order_id"]))
+            order_status = str(order.get("status") if order else "")
+            if not ok and order_status not in (
+                    "CANCELED", "FILLED", "REJECTED"):
+                self.store.update_pending_buy(
+                    pending_id,
+                    attempts=int(pending.get("attempts") or 0) + 1,
+                    reason="cancel_failed",
+                )
+                self.store.commit()
+                self.log.warning(
+                    "maker cancel not confirmed pending=%s; will retry",
+                    pending_id)
+                return
+        remaining = max(
+            0.0, float(pending.get("shares") or 0.0)
+            - float(pending.get("filled_shares") or 0.0))
+        if remaining <= 1e-9:
+            self._finish_pending_buy(pending, "DONE", "filled", now)
+            return
+        reason = str(pending.get("reason") or "canceled")
+        if (not allow_tail or reason != "timeout"
+                or not self.allow_tail_entries or target is None):
+            self._finish_pending_buy(pending, "DONE", reason, now)
+            return
+        if not target.enabled:
+            self._finish_pending_buy(pending, "DONE", "target_disabled", now)
+            return
+        block = self.executor.entry_cancel_reason(store=self.store)
+        if block:
+            self._finish_pending_buy(pending, "DONE", block, now)
+            return
+        end_ts = int(pending.get("end_ts") or 0)
+        if (target.min_hours_to_end > 0 and end_ts
+                and end_ts - now < int(target.min_hours_to_end * 3600)):
+            self._finish_pending_buy(
+                pending, "DONE", "expiry_too_close", now)
+            return
+        if self.store.target_shares(
+                str(pending["target"]), str(pending["token_id"])) <= 1e-9:
+            self._finish_pending_buy(
+                pending, "DONE", "target_flat_before_tail", now)
+            return
+        won = self.store.transition_pending_buy(
+            pending_id, from_statuses=("CANCEL_REQUESTED",),
+            to_status="TAIL_SUBMITTED", reason="timeout", ts=now,
+            cancel_confirmed=1,
+        )
+        self.store.commit()
+        if not won:
+            return
+        pending = self.store.pending_buy(pending_id) or pending
+        cap = min(
+            0.999,
+            float(pending.get("signal_price") or 0.0)
+            * (1.0 + float(target.fak_max_premium_pct)),
+        )
+        if cap <= 0:
+            self._finish_pending_buy(pending, "FAILED", "bad_tail_cap", now)
+            return
+        market_usd = (
+            self.store.market_exposure(
+                str(pending["condition_id"]), str(pending["target"]))
+            + self.store.pending_buy_commitment(
+                target=str(pending["target"]),
+                condition_id=str(pending["condition_id"]),
+                exclude_id=pending_id,
+            )
+        )
+        intent = TradeIntent(
+            dedupe_key=str(pending["signal_key"]) + ":tail",
+            target=str(pending["target"]),
+            condition_id=str(pending["condition_id"]),
+            token_id=str(pending["token_id"]),
+            outcome=str(pending.get("outcome") or ""),
+            title=str(pending.get("title") or ""),
+            event_slug=str(pending.get("event_slug") or ""),
+            side="BUY", shares=remaining, limit_price=cap,
+            signal_price=float(pending.get("signal_price") or 0.0),
+            fee_rate=self._fee_rate(target),
+            max_spend=self._available_cash(),
+            max_market=max(0.0, target.max_market_usd - market_usd),
+            min_notional=0.0, source="maker_tail",
+        )
+        try:
+            result = self.executor.buy(intent, store=self.store)
+        except Exception:
+            self.log.exception("tail buy failed pending=%s", pending_id)
+            result = None
+        order = self.store.order_for(
+            intent.dedupe_key, "BUY", "live",
+            target=str(pending["target"]))
+        if order is not None:
+            self.store.update_pending_buy(
+                pending_id, fak_order_id=int(order["id"]))
+            self.store.commit()
+        self._refresh_pending_totals(pending_id)
+        pending = self.store.pending_buy(pending_id) or pending
+        if float(pending.get("filled_shares") or 0.0) >= (
+                float(pending.get("shares") or 0.0) - 1e-9):
+            self._finish_pending_buy(pending, "DONE", "filled", now)
+            return
+        tail = (self.store.order(int(pending["fak_order_id"]))
+                if pending.get("fak_order_id") else None)
+        tail_status = str(tail.get("status") if tail else "")
+        if (result is None
+                or result.status in ("no_fill", "rejected", "dry_run",
+                                     "canceled")
+                or tail_status in ("CANCELED", "REJECTED")):
+            reason = (
+                getattr(result, "reason", None) if result is not None else None
+            ) or "fallback_no_fill"
+            self._finish_pending_buy(
+                pending,
+                "DONE" if float(pending.get("filled_shares") or 0) > 0
+                else "FAILED",
+                reason, now,
+            )
+            return
+        self.store.update_pending_buy(
+            pending_id, attempts=int(pending.get("attempts") or 0) + 1)
+        self.store.commit()
+        self.log.warning(
+            "TAIL SUBMITTED %-8s pending=%s order=%s sh=%.4f cap=%.4f",
+            str(pending.get("target") or "")[:10], pending_id,
+            pending.get("fak_order_id"), remaining, cap)
+
+    def _process_tail(self, pending: dict[str, Any],
+                      target: TargetConfig | None, now: int) -> None:
+        pending_id = int(pending["id"])
+        if not pending.get("fak_order_id"):
+            order = self.store.order_for(
+                str(pending["signal_key"]) + ":tail", "BUY", "live",
+                target=str(pending["target"]))
+            if order is not None:
+                self.store.update_pending_buy(
+                    pending_id, fak_order_id=int(order["id"]))
+                self.store.commit()
+                pending = self.store.pending_buy(pending_id) or pending
+            else:
+                self.store.update_pending_buy(
+                    pending_id, status="UNKNOWN",
+                    reason="tail_order_missing")
+                self._refresh_pending_totals(
+                    pending_id, terminal_reason="tail_order_missing")
+                self.log.critical(
+                    "tail order missing pending=%s; manual check",
+                    pending_id)
+                return
+        self._refresh_pending_totals(pending_id)
+        pending = self.store.pending_buy(pending_id) or pending
+        remaining = max(
+            0.0, float(pending.get("shares") or 0.0)
+            - float(pending.get("filled_shares") or 0.0))
+        if remaining <= 1e-9:
+            self._finish_pending_buy(pending, "DONE", "filled", now)
+            return
+        order = (self.store.order(int(pending["fak_order_id"]))
+                 if pending.get("fak_order_id") else None)
+        order_status = str(order.get("status") if order else "")
+        if order_status in ("FILLED", "CANCELED", "REJECTED"):
+            reason = ("filled" if order_status == "FILLED"
+                      else "fallback_no_fill")
+            self._finish_pending_buy(
+                pending,
+                "DONE" if float(pending.get("filled_shares") or 0) > 0
+                else "FAILED",
+                reason, now,
+            )
+            return
+        if now > int(pending.get("deadline_ts") or 0) + 300:
+            self.store.update_pending_buy(
+                pending_id, status="UNKNOWN", reason="tail_timeout")
+            self._refresh_pending_totals(
+                pending_id, terminal_reason="tail_timeout")
+            self.log.critical(
+                "tail order unresolved pending=%s; manual check", pending_id)
+            return
+        self.store.update_pending_buy(
+            pending_id, attempts=int(pending.get("attempts") or 0) + 1)
+        self.store.commit()
+
+    # ------------------------------------------------------------ risk exits
+    def check_risk_exits(self) -> int:
+        targets = {
+            t.address.lower(): t for t in self.cfg.targets.values()
+            if t.take_profit_pct > 0 or t.stop_loss_pct > 0
+        }
+        if not targets:
+            return 0
+        eligible: list[tuple[dict[str, Any], TargetConfig]] = []
+        for pos in self.store.open_positions(limit=10_000):
+            target = targets.get(str(pos.get("target") or "").lower())
+            if target is None:
+                continue
+            shares = float(pos.get("shares") or 0.0)
+            if shares <= 1e-9:
+                continue
+            if (self.executor.is_live
+                    and shares < float(self.executor.min_shares)):
+                continue
+            cond = str(pos.get("condition_id") or "")
+            token = str(pos.get("token_id") or "")
+            if self.store.pending_exit(pos["target"], cond, token):
+                continue
+            if self.store.has_pending_manual_sell(pos["target"], cond, token):
+                continue
+            market = self._market(cond)
+            if market and market.get("closed"):
+                continue
+            eligible.append((pos, target))
+        if not eligible:
+            return 0
+        tokens = [str(pos["token_id"]) for pos, _ in eligible]
+        prices: dict[str, float] = {}
+        for start in range(0, len(tokens), 100):
+            chunk = tokens[start:start + 100]
+            try:
+                prices.update(self.clob.midpoints(chunk))
+            except Exception:
+                self.log.exception("risk price batch failed")
+        exited = 0
+        for pos, target in eligible:
+            mid = prices.get(str(pos["token_id"]))
+            if mid is None:
+                continue
+            avg = float(pos.get("avg_cost") or 0.0)
+            if avg <= 0:
+                continue
+            trigger = None
+            if (target.take_profit_pct > 0
+                    and mid >= avg * (1.0 + target.take_profit_pct)):
+                trigger = "take_profit"
+            elif (target.stop_loss_pct > 0
+                    and mid <= avg * (1.0 - target.stop_loss_pct)):
+                trigger = "stop_loss"
+            if trigger is None:
+                continue
+            if self._risk_exit(pos, target, trigger):
+                exited += 1
+        self.store.commit()
+        return exited
+
+    def _risk_exit(self, pos: dict[str, Any], target: TargetConfig,
+                   trigger: str) -> bool:
+        cond = str(pos.get("condition_id") or "")
+        token = str(pos.get("token_id") or "")
+        self._cancel_pending_for_token(
+            target, cond, token, "risk_exit", fraction=None)
+        pos = self.store.position(target.address, cond, token)
+        if not pos or pos.get("status") != "OPEN":
+            return False
+        shares = float(pos.get("shares") or 0.0)
+        if shares <= 1e-9:
+            return False
+        if (self.executor.is_live
+                and shares < float(self.executor.min_shares)):
+            return False
+        now = int(time.time())
+        intent = TradeIntent(
+            dedupe_key=f"risk:{pos['id']}:{time.time_ns()}",
+            target=target.address, condition_id=cond, token_id=token,
+            outcome=str(pos.get("outcome") or ""),
+            title=str(pos.get("title") or ""),
+            event_slug=str(pos.get("event_slug") or ""),
+            side="SELL", shares=shares, limit_price=0.001,
+            signal_price=0.0, fee_rate=self._fee_rate(target),
+            strict=True, source="risk_exit",
+        )
+        result = self.executor.sell(intent, store=self.store)
+        if not result.fills:
+            if result.status in ("dry_run", "submitted"):
+                return False
+            self.store.queue_pending_exit(
+                target=target.address, condition_id=cond, token_id=token,
+                outcome=str(pos.get("outcome") or ""), shares=shares,
+                reason=trigger, ts=now, kind="RISK",
+            )
+            self.store.commit()
+            self.log.warning(
+                "RISK EXIT not filled %s %-8s sh=%.4f reason=%s",
+                trigger, target.address[:10], shares,
+                result.reason or result.status or "no_fill")
+            return False
+        applied = None
+        for fill in result.fills:
+            applied = self.store.apply_sell(
+                ts=now, target=target.address, signal_id=None,
+                condition_id=cond, token_id=token,
+                outcome=str(pos.get("outcome") or ""),
+                shares=fill.shares, price=fill.price, fee=fill.fee,
+                note=trigger, order_id=fill.order_id, kind="RISK",
+            ) or applied
+        if applied is None:
+            return False
+        remaining = shares - result.filled_shares
+        if remaining > 1e-9:
+            self.store.queue_pending_exit(
+                target=target.address, condition_id=cond, token_id=token,
+                outcome=str(pos.get("outcome") or ""), shares=remaining,
+                reason=trigger, ts=now, kind="RISK",
+            )
+        self.store.commit()
+        avg = (result.notional / result.filled_shares
+               if result.filled_shares else 0.0)
+        self.log.warning(
+            "RISK EXIT %-12s %-8s px=%.4f sh=%.4f $=%.2f fee=%.4f "
+            "remaining=%.4f mode=%s %s",
+            trigger, target.address[:10], avg, result.filled_shares,
+            result.notional, result.fee, max(0.0, remaining),
+            "live" if self.executor.is_live else "paper",
+            str(pos.get("title") or "")[:40],
+        )
+        return True
 
     def reconcile_target_positions(self) -> int:
         """Replace target_positions with the target's actual open positions.
@@ -718,6 +1478,7 @@ class Engine:
         """
         now = int(time.time())
         total = 0
+        failed = False
         for name, target in self.cfg.targets.items():
             if not target.enabled:
                 continue
@@ -725,6 +1486,7 @@ class Engine:
                 target.address, limit=500, max_pages=10,
             )
             if rows is None:
+                failed = True
                 self.log.warning(
                     "target ledger reconciliation failed target=%s", name)
                 continue
@@ -750,6 +1512,9 @@ class Engine:
             total += len(positions)
             self.log.info(
                 "TARGET LEDGER %-8s positions=%d", name, len(positions))
+        self._target_ledger_ok = not failed
+        if not failed:
+            self.store.set_kv("target_ledger:reconciled_at", str(now))
         self.store.commit()
         return total
 
@@ -765,6 +1530,9 @@ class Engine:
                 continue
             shares = float(pos.get("shares") or 0.0)
             if shares <= 1e-12:
+                continue
+            grace = float(self.cfg.paper.orphan_grace_seconds or 0.0)
+            if grace > 0 and now - int(pos.get("opened_at") or 0) < grace:
                 continue
             if (self.executor.is_live
                     and shares < float(self.executor.min_shares)):
@@ -939,6 +1707,12 @@ class Engine:
             self.store.set_mark(token_id, bid, ask, mid, now)
         self.store.commit()
         return len(updates)
+
+
+def _dt(ts: int) -> str:
+    if not ts:
+        return "--"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)) + "Z"
 
 
 def _json_list(value: Any) -> list[str]:

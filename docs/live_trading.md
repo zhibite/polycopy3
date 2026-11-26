@@ -81,8 +81,13 @@ kill switch 和日亏损上限阻挡。
 - 每笔实盘订单先写 `orders` 表（`INTENT`）并 commit，再发网络请求。
 - 签名后、提交前记录 `client_order_id`（订单 hash）；重启对账时按该 id
   查询交易所，**不会自动重发**。查不到就标 `UNKNOWN` 并要求人工检查。
-- 第一版只使用 FAK 限价单：买单限价 = 信号价 + 允许滑点，卖单限价 =
-  信号价 - 允许滑点；成交不了的剩余部分由交易所自动取消，不挂单。
+- 入场默认先挂 GTC maker（价格 = 目标成交价），超时未成交再撤单并用 FAK
+  补剩余（价格上限 = 目标价 × 1.02）；`maker_entry_enabled=false` 或纸盘时
+  仍直接 FAK。目标卖出、REDEEM/MERGE、kill switch、市场关闭会撤销未完成挂单。
+- 卖单：strict exit 使用 FAK 限价 0.001（接受任意买一价），成交不了的剩余
+  由 `pending_exits` 重试。止盈止损同样走 strict FAK，但标记 `kind=RISK`。
+- 多地址、maker 状态机、止盈止损的完整说明见
+  [multi_target_copy.md](multi_target_copy.md)。
 - `fills.order_id` 关联到订单，便于逐笔核对。
 - `live check` 不提交订单；`kill switch` 触发后只停止买入。
 
@@ -126,6 +131,10 @@ sqlite3 data/paper_f705.db \
 环境变量指向实盘库和实盘配置（或单独起一个面板实例）。
 
 ## 7. 已知边界
+
+- 多地址配置、maker 挂单、止盈止损见
+  [multi_target_copy.md](multi_target_copy.md)。新增/删除地址后必须重启，
+  因为链上订阅的 wallet 集合在进程启动时固定。
 
 - SDK 的具体版本会随 Protocol V2 演进；升级后必须重新跑 `live check` 和
   一笔最小实盘单。

@@ -47,6 +47,9 @@ class OnchainRunner:
             self._trace = open(self.trace_path, "a", encoding="utf-8")
         self._last_maint = 0.0
         self._last_health = 0.0
+        self._last_trade_tick = 0.0
+        self._last_ledger_try = 0.0
+        self._startup_ready = False
         self._processed = 0
         self._failed = 0
         self._cursor_pending: int | None = None
@@ -56,9 +59,12 @@ class OnchainRunner:
 
     def run(self) -> int:
         try:
-            self.engine.executor.reconcile()
+            self.engine.executor.reconcile(store=self.engine.store)
         except Exception:
             self.log.exception("startup executor reconciliation failed")
+        # Do not tail stale maker entries until the feed has caught up and the
+        # target position ledger has been reconciled.
+        self.engine.allow_tail_entries = False
         # A restart request left over from a previous process should not make
         # a fresh start immediately bounce.  Requests are only honoured while
         # this process is running.
@@ -88,6 +94,29 @@ class OnchainRunner:
                     break
 
                 now = time.time()
+                if (not self._startup_ready and self.feed.ready.is_set()
+                        and self.feed.queue.empty()
+                        and now - self._last_ledger_try >= 30.0):
+                    self._last_ledger_try = now
+                    try:
+                        self.engine.reconcile_target_positions()
+                    except Exception:
+                        self.log.exception(
+                            "startup target ledger reconciliation failed")
+                    if (self.engine._target_ledger_ok
+                            and self.feed.queue.empty()):
+                        self.engine.allow_tail_entries = True
+                        self._startup_ready = True
+                        self.log.info(
+                            "target ledger ready; maker tails enabled")
+
+                if now - self._last_trade_tick >= 1.0:
+                    try:
+                        self.engine.trading_tick()
+                    except Exception:
+                        self.log.exception("trading tick failed")
+                    self._last_trade_tick = now
+
                 if now - self._last_maint >= 2.0:
                     try:
                         self.engine.maybe_reload_config()
@@ -349,6 +378,8 @@ def build_and_run(engine: Engine, settings: OnchainSettings, *,
         include_event_slug=include_event_slug,
         logger=logging.getLogger("polycopy.onchain.meta"),
     )
+    # Gamma is passed unconditionally so the resolver can resolve the market
+    # end date even when no event-slug exclusion is configured.
     feed = OrderFilledFeed(
         rpc, wallets,
         ws_urls=settings.ws_urls,

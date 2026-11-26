@@ -20,6 +20,7 @@
       <option value="copy_buy" {{ 'selected' if filters.fill_type == 'copy_buy' else '' }}>跟单买入</option>
       <option value="copy_sell" {{ 'selected' if filters.fill_type == 'copy_sell' else '' }}>跟单卖出</option>
       <option value="manual_sell" {{ 'selected' if filters.fill_type == 'manual_sell' else '' }}>手动卖出</option>
+      <option value="risk" {{ 'selected' if filters.fill_type == 'risk' else '' }}>止盈/止损</option>
     </select>
   </label>
   <label>目标钱包
@@ -71,7 +72,7 @@
     <table>
       <thead>
         <tr>
-          <th>时间</th><th>类型</th><th>市场</th><th>结果</th>
+          <th>时间</th><th>类型</th><th>跟单地址</th><th>市场</th><th>结果</th>
           <th>价格</th><th>数量</th><th>金额</th><th>手续费</th><th>已实现盈亏</th>
         </tr>
       </thead>
@@ -82,11 +83,17 @@
             <td>
               {% if f.kind == 'MANUAL' %}
                 <span class="pill warn">手动卖出</span>
+              {% elif f.kind == 'RISK' %}
+                <span class="pill sell">{{ '止盈' if f.note == 'take_profit' else '止损' if f.note == 'stop_loss' else '风控退出' }}</span>
               {% elif f.side == 'BUY' %}
                 <span class="pill buy">跟单买入</span>
               {% else %}
                 <span class="pill sell">跟单卖出{% if f.note == 'strict_exit' %} · 强平{% elif f.note == 'reconciled' %} · 对账{% endif %}</span>
               {% endif %}
+            </td>
+            <td class="mono muted" title="{{ f.target }}">
+              {% set tname = target_names.get((f.target or '')|lower) %}
+              {{ tname if tname else (f.target|short_addr) }}
             </td>
             <td title="{{ f.title }}">
               {% if f.event_slug or f.market_slug %}
@@ -105,7 +112,7 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="9" class="no-data">暂无符合条件的成交</td></tr>
+          <tr><td colspan="10" class="no-data">暂无符合条件的成交</td></tr>
         {% endfor %}
       </tbody>
     </table>

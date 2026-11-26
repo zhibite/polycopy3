@@ -35,6 +35,8 @@ class LiveOrderResult:
     reason: str | None = None
     order_id: str | None = None
     raw: dict[str, Any] | None = None
+    remote_status: str = ""
+    canceled: bool = False
 
 
 class SdkClobGateway:
@@ -153,6 +155,59 @@ class SdkClobGateway:
         return self._place("SELL", token_id=token_id, price=price, size=size,
                            fee_rate=fee_rate, on_prepared=on_prepared)
 
+    def place_limit_buy(self, *, token_id: str, price: float, size: float,
+                        fee_rate: float, on_prepared=None) -> LiveOrderResult:
+        """Post a resting GTC buy.  size is in outcome shares."""
+        sdk = self._load_sdk()
+        client = self._get_client()
+        tick = self.tick_size(token_id)
+        options = None
+        if hasattr(sdk, "PartialCreateOrderOptions"):
+            try:
+                options = sdk.PartialCreateOrderOptions(
+                    tick_size=str(tick), neg_risk=self.neg_risk(token_id))
+            except Exception:  # noqa: BLE001
+                self.log.debug("order options failed token=%s", token_id,
+                               exc_info=True)
+                options = None
+        args = {
+            "price": float(price),
+            "size": float(size),
+            "side": sdk.Side.BUY,
+        }
+        try:
+            params = inspect.signature(sdk.OrderArgs).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "position_id" in params and "token_id" not in params:
+            args["position_id"] = token_id
+        else:
+            args["token_id"] = token_id
+        order_args = sdk.OrderArgs(**args)
+        if options is not None:
+            try:
+                signed = client.create_order(order_args, options=options)
+            except TypeError:
+                signed = client.create_order(order_args)
+        else:
+            signed = client.create_order(order_args)
+        client_id = _order_hash(signed)
+        if on_prepared is not None:
+            on_prepared(client_id, signed)
+        response = client.post_order(
+            signed, sdk.OrderType.GTC, post_only=False)
+        return self.parse_order(response, side="BUY", fee_rate=fee_rate)
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        client = self._get_client()
+        sdk = self._load_sdk()
+        payload_cls = getattr(sdk, "OrderPayload", None)
+        if payload_cls is not None:
+            result = client.cancel_order(payload_cls(orderID=str(order_id)))
+        else:
+            result = client.cancel_order(str(order_id))
+        return result if isinstance(result, dict) else {"response": result}
+
     def _place(self, side: str, *, token_id: str, price: float, size: float,
                fee_rate: float, on_prepared=None) -> LiveOrderResult:
         sdk = self._load_sdk()
@@ -248,8 +303,11 @@ class SdkClobGateway:
                            or "order_rejected"),
                 order_id=_first(response, "orderID", "orderId", "id"),
                 raw=raw,
+                remote_status=str(response.get("status") or ""),
             )
         status = str(response.get("status") or "").lower()
+        canceled = status in ("canceled", "cancelled", "expired",
+                              "unmatched", "unfilled")
         making = _amount(response.get("makingAmount"))
         taking = _amount(response.get("takingAmount"))
         if side == "BUY":
@@ -271,13 +329,13 @@ class SdkClobGateway:
                     if price > 0:
                         break
         if shares <= 0 or price <= 0:
-            terminal = status in ("canceled", "cancelled", "expired",
-                                  "unmatched", "unfilled")
             return LiveOrderResult(
-                status="canceled" if terminal else "submitted",
-                reason=None if terminal else (status or "no_fill"),
+                status="canceled" if canceled else "submitted",
+                reason=None if canceled else (status or "no_fill"),
                 order_id=_first(response, "orderID", "orderId", "id"),
                 raw=raw,
+                remote_status=status,
+                canceled=canceled,
             )
         fee = _amount(response.get("fee") or response.get("feeAmount"))
         if fee <= 0:
@@ -286,9 +344,12 @@ class SdkClobGateway:
             filled_size=shares,
             avg_price=price,
             fee=fee,
-            status="filled" if status in ("matched", "filled", "") else "partial",
+            status=("filled" if status in ("matched", "filled", "")
+                    else "canceled" if canceled else "partial"),
             order_id=_first(response, "orderID", "orderId", "id"),
             raw=raw,
+            remote_status=status,
+            canceled=canceled,
         )
 
     # -------------------------------------------------------------- account

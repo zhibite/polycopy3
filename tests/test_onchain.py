@@ -187,6 +187,27 @@ class TokenResolverTest(unittest.TestCase):
         resolver = TokenResolver(FakeClob([{"token_id": "other"}]))
         self.assertIsNone(resolver.resolve("t1"))
 
+    def test_resolves_market_end_timestamp(self):
+        class ExpiryClob(FakeClob):
+            def market(self, condition_id):
+                body = super().market(condition_id)
+                body["end_date_iso"] = "2026-01-01T00:00:00Z"
+                return body
+
+        resolver = TokenResolver(ExpiryClob([{"token_id": "t1", "outcome": "Yes"}]))
+        meta = resolver.resolve("t1")
+        self.assertEqual(meta.end_ts, 1_767_225_600)
+        fill = decode_order_filled(BUY_LOG)
+        row = fill.to_row(meta)
+        self.assertEqual(row["end_ts"], 1_767_225_600)
+
+    def test_old_cached_metadata_without_end_ts_loads(self):
+        meta = TokenMeta(**{
+            "condition_id": "c1", "token_id": "t1", "outcome": "Yes",
+            "outcome_index": 0, "title": "T", "slug": "s", "event_slug": "e",
+        })
+        self.assertIsNone(meta.end_ts)
+
 
 class FeedTest(unittest.TestCase):
     def test_catch_up_enqueues_and_dedupes(self):

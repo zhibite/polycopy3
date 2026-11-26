@@ -91,7 +91,7 @@ button.btn:disabled { opacity: .45; cursor: default; filter: none; }
 }
 .filters input:focus, .filters select:focus { outline: none; border-color: #7c3aed; }
 
-.tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
 .tabs a { padding: 7px 16px; border-radius: 999px; background: #12122a; border: 1px solid #1e1e3a; color: #a0a0b0; text-decoration: none; font-size: 13px; }
 .tabs a.active { background: #1e1b4b; border-color: #4c1d95; color: #c4b5fd; }
 

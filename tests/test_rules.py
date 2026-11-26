@@ -1,7 +1,10 @@
 import unittest
 
 from polycopy.config import TargetConfig
-from polycopy.rules import buy_skip_reason, dedupe_key, desired_notional, target_usd
+from polycopy.rules import (
+    buy_skip_reason, dedupe_key, desired_notional, market_end_ts, parse_ts,
+    target_usd,
+)
 
 
 def row(**overrides):
@@ -71,6 +74,31 @@ class RulesTest(unittest.TestCase):
         self.t.sizing_mode = "fixed"
         self.t.fixed_notional_usd = 7.0
         self.assertAlmostEqual(desired_notional(self.t, 1000.0), 7.0)
+
+    def test_expiry_gate(self):
+        self.t.min_hours_to_end = 2.0
+        now = 1_000
+        self.assertIsNone(self.gate(row(), now=now, end_ts=now + 7_200))
+        self.assertEqual(
+            self.gate(row(), now=now, end_ts=now + 7_199), "expiry_too_close")
+        self.assertEqual(
+            self.gate(row(), now=now, end_ts=None), "expiry_unknown")
+        self.t.min_hours_to_end = 0.0
+        self.assertIsNone(self.gate(row(), now=now, end_ts=None))
+
+    def test_parse_timestamps(self):
+        self.assertEqual(parse_ts("2026-01-01T00:00:00Z"), 1_767_225_600)
+        self.assertEqual(parse_ts(1_767_225_600), 1_767_225_600)
+        self.assertEqual(parse_ts(1_767_225_600_000), 1_767_225_600)
+        self.assertIsNone(parse_ts("not-a-date"))
+        self.assertIsNone(parse_ts(0))
+        self.assertEqual(
+            market_end_ts({"endDate": "2026-01-01T00:00:00Z"}),
+            1_767_225_600)
+        self.assertEqual(
+            market_end_ts({"end_date_iso": "2026-01-01T00:00:00Z"}),
+            1_767_225_600)
+        self.assertIsNone(market_end_ts({}))
 
 
 if __name__ == "__main__":

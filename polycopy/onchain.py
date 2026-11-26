@@ -39,6 +39,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
+from . import rules
 from .http import UA
 
 V2_CTF_EXCHANGE = "0xe111180000d2663c0091e4f400237545b87b996b"
@@ -159,6 +160,7 @@ class OrderFill:
             "title": meta.title,
             "slug": meta.slug,
             "event_slug": meta.event_slug,
+            "end_ts": meta.end_ts,
             "log_index": self.log_index,
             "source": source,
         }
@@ -316,6 +318,7 @@ class TokenMeta:
     title: str = ""
     slug: str = ""
     event_slug: str = ""
+    end_ts: int | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -326,6 +329,7 @@ class TokenMeta:
             "title": self.title,
             "slug": self.slug,
             "event_slug": self.event_slug,
+            "end_ts": self.end_ts,
         }
 
 
@@ -390,15 +394,19 @@ class TokenResolver:
                              token_id, condition_id)
             return None
         event_slug = ""
-        if self.include_event_slug and self.gamma is not None:
+        end_ts = rules.market_end_ts(market)
+        if self.gamma is not None and (self.include_event_slug or end_ts is None):
             try:
                 gm = self.gamma.market_by_condition(condition_id) or {}
-                events = gm.get("events") or []
-                if events:
-                    event_slug = str(events[0].get("slug") or "")
+                if end_ts is None:
+                    end_ts = rules.market_end_ts(gm)
+                if self.include_event_slug:
+                    events = gm.get("events") or []
+                    if events:
+                        event_slug = str(events[0].get("slug") or "")
             except Exception:
-                self.log.debug("event slug lookup failed for %s", condition_id,
-                               exc_info=True)
+                self.log.debug("gamma metadata lookup failed for %s",
+                               condition_id, exc_info=True)
         return TokenMeta(
             condition_id=condition_id,
             token_id=token_id,
@@ -407,12 +415,13 @@ class TokenResolver:
             title=str(market.get("question") or ""),
             slug=str(market.get("market_slug") or ""),
             event_slug=event_slug,
+            end_ts=end_ts,
         )
 
     def _from_store(self, token_id: str) -> TokenMeta | None:
         if self.store is None:
             return None
-        raw = self.store.get_kv("tokenmeta:" + token_id)
+        raw = self.store.get_kv("tokenmeta:v2:" + token_id)
         if not raw:
             return None
         try:
@@ -425,7 +434,7 @@ class TokenResolver:
         if self.store is None:
             return
         try:
-            self.store.set_kv("tokenmeta:" + meta.token_id,
+            self.store.set_kv("tokenmeta:v2:" + meta.token_id,
                               json.dumps(meta.as_json(), separators=(",", ":")))
         except Exception:
             self.log.debug("failed to cache token metadata", exc_info=True)
@@ -469,6 +478,7 @@ class OrderFilledFeed:
         self.log = logger or logging.getLogger("polycopy.onchain.feed")
 
         self.queue: queue.Queue[OrderFill] = queue.Queue()
+        self.ready = threading.Event()
         self.last_block = start_block
         self.connected = False
         self.reconnects = 0
@@ -571,6 +581,7 @@ class OrderFilledFeed:
             self.connected = True
             self.log.info("subscribed %s", subscription)
             self._catch_up()
+            self.ready.set()
 
             while not self._stop.is_set():
                 try:
@@ -595,6 +606,7 @@ class OrderFilledFeed:
         self.log.info("RPC polling every %.1fs", self.poll_fallback_seconds)
         while not self._stop.is_set():
             self._catch_up()
+            self.ready.set()
             self._stop.wait(self.poll_fallback_seconds)
         self.connected = False
 

@@ -93,21 +93,21 @@ class FakeExecutor:
         self.buys = []
         self.sells = []
 
-    def available_cash(self, fallback):
+    def available_cash(self, fallback, store=None):
         return fallback
 
-    def buy(self, intent):
+    def buy(self, intent, store=None):
         self.buys.append(intent)
         return ExecutionResult(
             fills=[Fill(intent.shares, intent.limit_price - 0.03, 0.0)],
             status="filled",
         )
 
-    def sell(self, intent):
+    def sell(self, intent, store=None):
         self.sells.append(intent)
         return ExecutionResult(status="no_fill", reason="no_liquidity")
 
-    def reconcile(self):
+    def reconcile(self, store=None):
         return None
 
     def redeem(self, condition_id):
@@ -182,6 +182,43 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(summary[0]["reason"], "price_out_of_range")
         self.assertEqual(summary[0]["copied"], 0)
 
+    def test_paper_ignores_maker_entry(self):
+        now = int(time.time())
+        engine, store = self.make_engine(
+            [trade_row("BUY", 100, 0.50, now - 5, tx="0x1")])
+        engine.cfg.targets["t"].maker_entry_enabled = True
+        engine.cycle()
+        self.assertEqual(store.pending_buys(), [])
+        self.assertEqual(store.count_open_positions(), 1)
+        self.assertEqual(store.signal_counts()[1], 1)
+
+    def test_expiry_gate_skips_too_close_and_unknown(self):
+        now = int(time.time())
+        engine, store = self.make_engine([])
+        target = engine.cfg.targets["t"]
+        target.min_hours_to_end = 2.0
+        engine.ingest_rows(
+            "t", target,
+            [dict(trade_row("BUY", 100, 0.50, now - 5, tx="0x1"),
+                  end_ts=now + 3600)],
+            source="test",
+        )
+        engine.ingest_rows(
+            "t", target,
+            [dict(trade_row("BUY", 100, 0.50, now - 4, tx="0x2"),
+                  end_ts=now + 4 * 3600)],
+            source="test",
+        )
+        engine.ingest_rows(
+            "t", target,
+            [trade_row("BUY", 100, 0.50, now - 3, tx="0x3")],
+            source="test",
+        )
+        summary = {row["reason"]: row for row in store.signal_summary()}
+        self.assertEqual(summary["expiry_too_close"]["n"], 1)
+        self.assertEqual(summary["expiry_unknown"]["n"], 1)
+        self.assertEqual(store.count_open_positions(), 1)
+
     def test_settlement_pays_winner(self):
         now = int(time.time())
         rows = [trade_row("BUY", 100, 0.50, now - 5)]
@@ -233,7 +270,8 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(store.all_signals()[-1]["reason"], "exit_pending")
 
         clob.fail = False
-        engine.maintenance()
+        engine._last_exit_retry = 0
+        engine.trading_tick()
         self.assertIsNone(store.pending_exit("0xabc", "c1", "t1"))
         self.assertAlmostEqual(
             store.position("0xabc", "c1", "t1")["shares"], 2.4)

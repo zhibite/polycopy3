@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import time
 import unittest
 
@@ -7,7 +8,9 @@ from polycopy.config import LiveConfig, PaperConfig
 from polycopy.execution import (
     Fill, LiveExecutor, PaperExecutor, TradeIntent,
 )
-from polycopy.live_client import LiveOrderResult, _market_order_amount
+from polycopy.live_client import (
+    LiveOrderResult, SdkClobGateway, _market_order_amount,
+)
 from polycopy.store import Store
 
 
@@ -307,6 +310,122 @@ class LiveExecutorTest(unittest.TestCase):
         # A second pass must not duplicate the local fill.
         executor.reconcile()
         self.assertEqual(store.fill_count_for_order(order["id"]), 1)
+
+    def test_refresh_order_applies_cumulative_deltas_once(self):
+        store, tmp = make_store(self)
+        cfg = self.live_cfg(tmp, dry_run=False)
+        order = store.create_order(
+            dedupe_key="d1", target="0xabc", mode="live", side="BUY",
+            condition_id="c1", token_id="t1", outcome="Yes",
+            title="Test", event_slug="test", limit_price=0.5, size=10.0,
+            status="SUBMITTED", client_order_id="client-9", fee_rate=0.0,
+        )
+        store.commit()
+
+        class RefreshGateway(FakeGateway):
+            cum = 4.0
+
+            def get_order(self, order_id):
+                return {"id": "o1"}
+
+            def parse_order(self, response, *, side, fee_rate):
+                return LiveOrderResult(
+                    filled_size=self.cum, avg_price=0.5, fee=0.0,
+                    status="filled" if self.cum >= 10 else "partial",
+                    order_id="exchange-9", raw=response,
+                )
+
+        gateway = RefreshGateway()
+        executor = LiveExecutor(store, cfg, FakeClob(), gateway=gateway,
+                                dry_run=False)
+        executor.refresh_order(order["id"])
+        executor.refresh_order(order["id"])
+        pos = store.position("0xabc", "c1", "t1")
+        self.assertAlmostEqual(pos["shares"], 4.0)
+        self.assertAlmostEqual(
+            store.fill_totals_for_order(order["id"])[0], 4.0)
+
+        gateway.cum = 10.0
+        executor.refresh_order(order["id"])
+        pos = store.position("0xabc", "c1", "t1")
+        self.assertAlmostEqual(pos["shares"], 10.0)
+        self.assertAlmostEqual(
+            store.fill_totals_for_order(order["id"])[0], 10.0)
+
+    def test_refresh_order_can_use_another_thread_store(self):
+        store, tmp = make_store(self)
+        cfg = self.live_cfg(tmp, dry_run=False)
+        executor = LiveExecutor(store, cfg, FakeClob(), gateway=FakeGateway(),
+                                dry_run=False)
+        errors = []
+
+        def worker():
+            worker_store = Store(store.path)
+            try:
+                result = executor.sell(intent(side="SELL"),
+                                       store=worker_store)
+                if result.status != "filled":
+                    errors.append(f"status={result.status}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(repr(exc))
+            finally:
+                worker_store.close()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_parse_order_keeps_canceled_with_partial_fill(self):
+        gateway = SdkClobGateway(LiveConfig())
+        parsed = gateway.parse_order(
+            {"status": "canceled", "size_matched": "5", "price": "0.5"},
+            side="BUY", fee_rate=0.0,
+        )
+        self.assertTrue(parsed.canceled)
+        self.assertEqual(parsed.status, "canceled")
+        self.assertAlmostEqual(parsed.filled_size, 5.0)
+        self.assertAlmostEqual(parsed.avg_price, 0.5)
+
+    def test_gateway_places_gtc_and_cancels(self):
+        class FakeClobClient:
+            def __init__(self):
+                self.args = None
+                self.posts = []
+                self.cancels = []
+
+            def create_order(self, order_args, options=None):
+                self.args = order_args
+                return {"hash": "order-hash-1"}
+
+            def post_order(self, order, order_type="GTC", post_only=False,
+                           defer_exec=False):
+                self.posts.append((order, order_type, post_only))
+                return {"status": "live", "orderID": "exchange-1"}
+
+            def cancel_order(self, payload):
+                self.cancels.append(payload.orderID)
+                return {"canceled": [payload.orderID]}
+
+        client = FakeClobClient()
+        gateway = SdkClobGateway(LiveConfig(dry_run=False), client=client)
+        prepared = []
+        result = gateway.place_limit_buy(
+            token_id="t1", price=0.5, size=20, fee_rate=0.0,
+            on_prepared=lambda cid, raw: prepared.append(cid),
+        )
+        self.assertEqual(prepared, ["order-hash-1"])
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(result.remote_status, "live")
+        self.assertEqual(client.posts[0][1], "GTC")
+        self.assertFalse(client.posts[0][2])
+        self.assertAlmostEqual(client.args.price, 0.5)
+        self.assertAlmostEqual(client.args.size, 20.0)
+        self.assertEqual(
+            gateway.cancel_order("exchange-1"),
+            {"canceled": ["exchange-1"]})
+        self.assertEqual(client.cancels, ["exchange-1"])
 
 
 if __name__ == "__main__":

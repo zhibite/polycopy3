@@ -30,6 +30,8 @@ class PaperConfig:
     settle_every_seconds: int = 300
     mark_every_seconds: int = 300
     target_reconcile_seconds: int = 60
+    risk_check_seconds: int = 30
+    orphan_grace_seconds: float = 0.0
     mark_limit: int = 100
     max_pages: int = 3
     page_limit: int = 500
@@ -59,6 +61,12 @@ class TargetConfig:
     max_market_usd: float = 300.0
     max_open_positions: int = 100
     fee_rate: float | None = None   # per-target override (e.g. 0.05 for BTC 5m/15m)
+    min_hours_to_end: float = 0.0        # 0 = gate off; production 2.0
+    maker_entry_enabled: bool = False    # live + non-dry-run only
+    maker_timeout_seconds: int = 300
+    fak_max_premium_pct: float = 0.02    # tail FAK cap = signal price * (1 + pct)
+    take_profit_pct: float = 0.0         # 0.10 = +10%, 0 = off
+    stop_loss_pct: float = 0.0           # 0.20 = -20%, 0 = off
     exclude_event_substrings: list[str] = field(default_factory=list)
     exclude_slug_substrings: list[str] = field(default_factory=list)
 
@@ -166,13 +174,44 @@ def load_config(path: str | Path) -> AppConfig:
     live = LiveConfig(**_filter_fields(LiveConfig, raw.get("live", {})))
     live.validate()
 
+    if paper.risk_check_seconds < 5:
+        raise ValueError("paper.risk_check_seconds must be >= 5")
+    if not (0.0 <= float(paper.orphan_grace_seconds) <= 3600.0):
+        raise ValueError("paper.orphan_grace_seconds must be between 0 and 3600")
+
     targets: dict[str, TargetConfig] = {}
+    seen_addresses: dict[str, str] = {}
     for name, tdata in (raw.get("targets") or {}).items():
         if not isinstance(tdata, dict) or not tdata.get("address"):
             raise ValueError(f"target {name!r} is missing an address")
-        targets[name] = TargetConfig(**_filter_fields(TargetConfig, tdata))
+        data = dict(tdata)
+        data["address"] = str(data["address"]).strip().lower()
+        target = TargetConfig(**_filter_fields(TargetConfig, data))
+        _validate_target(target, name)
+        if target.address in seen_addresses:
+            raise ValueError(
+                f"duplicate target address {target.address}: "
+                f"{seen_addresses[target.address]!r} and {name!r}")
+        seen_addresses[target.address] = name
+        targets[name] = target
     if not targets:
         raise ValueError("config must define at least one [targets.<name>]")
 
     return AppConfig(account=account, paper=paper, targets=targets,
                      run=run, live=live, path=path)
+
+
+def _validate_target(target: TargetConfig, name: str) -> None:
+    if target.sizing_mode not in ("scale", "fixed"):
+        raise ValueError(f"target {name!r}: sizing_mode must be scale or fixed")
+    if not (0.0 <= float(target.min_hours_to_end) <= 168.0):
+        raise ValueError(f"target {name!r}: min_hours_to_end must be 0..168")
+    if int(target.maker_timeout_seconds) < 1:
+        raise ValueError(f"target {name!r}: maker_timeout_seconds must be >= 1")
+    if not (0.0 <= float(target.fak_max_premium_pct) <= 0.5):
+        raise ValueError(
+            f"target {name!r}: fak_max_premium_pct must be 0..0.5")
+    if not (0.0 <= float(target.take_profit_pct) <= 1.0):
+        raise ValueError(f"target {name!r}: take_profit_pct must be 0..1")
+    if not (0.0 <= float(target.stop_loss_pct) <= 1.0):
+        raise ValueError(f"target {name!r}: stop_loss_pct must be 0..1")
