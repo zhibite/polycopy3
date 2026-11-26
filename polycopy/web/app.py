@@ -646,29 +646,35 @@ def config_page(request: Request, target: str = "", saved: str = "",
             "<p>请检查文件是否存在且为合法 TOML。</p>",
             status_code=500,
         )
-    if target == "__new__":
-        target_key = "__new__"
-        target_cfg = _default_target()
-        is_new = True
-    else:
-        target_key = target if target in cfg.targets else next(iter(cfg.targets))
-        target_cfg = cfg.targets[target_key]
-        is_new = False
+    common = dict(
+        csrf=session.csrf if session else "",
+        saved=bool(saved), mode_changed=bool(mode_changed), error=None,
+        restart_requested=bool(restart_requested), restart_error=restart_error,
+        targets_changed=bool(targets_changed), delete_error=delete_error,
+        config_path=str(queries.CONFIG_PATH), db_path=str(queries.DB_PATH),
+    )
+    if target:
+        if target == "__new__":
+            target_key = "__new__"
+            target_cfg = _default_target()
+            is_new = True
+        else:
+            target_key = target if target in cfg.targets else next(iter(cfg.targets))
+            target_cfg = cfg.targets[target_key]
+            is_new = False
+        return _render(
+            request, "config_target.html", "config", cfg=cfg,
+            target_name=target_key, target_key=target_key, target=target_cfg,
+            is_new=is_new, new_target_name="", **common,
+        )
     conn = queries.connect()
     try:
         pending = queries.active_pending_buys(conn)
     finally:
         queries.close(conn)
     return _render(
-        request, "config.html", "config", cfg=cfg, target_name=target_key,
-        target_key=target_key, target=target_cfg, is_new=is_new,
-        csrf=session.csrf if session else "",
-        saved=bool(saved), mode_changed=bool(mode_changed), error=None,
-        restart_requested=bool(restart_requested), restart_error=restart_error,
-        targets_changed=bool(targets_changed), delete_error=delete_error,
-        pending_buys=pending,
-        config_path=str(queries.CONFIG_PATH), db_path=str(queries.DB_PATH),
-        run=cfg.run, live=cfg.live,
+        request, "config_global.html", "config", cfg=cfg,
+        pending_buys=pending, run=cfg.run, live=cfg.live, **common,
     )
 
 
@@ -715,19 +721,9 @@ def _flist(form: Any, key: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-@app.post("/config")
-async def config_save(request: Request):
-    session = auth.current_session(request)
-    if session is None:
-        return RedirectResponse("/login?next=/config", status_code=302)
-    form = await request.form()
-    if not secrets.compare_digest(str(form.get("csrf") or ""), session.csrf):
-        raise HTTPException(status_code=400, detail="CSRF 校验失败，请刷新页面重试")
-    cfg = _load_cfg()
-    if cfg is None or not cfg.targets:
-        raise HTTPException(status_code=500, detail="无法读取当前配置")
-    errors: list[str] = []
-
+def _parse_global_form(form: Any, cfg: AppConfig,
+                       errors: list[str]) -> tuple[Any, RunConfig, Any]:
+    """Parse the common settings shared by all target addresses."""
     paper = replace(
         cfg.paper,
         poll_seconds=_fint(form, "paper.poll_seconds", cfg.paper.poll_seconds, errors, "轮询间隔", 2, 3600),
@@ -794,6 +790,85 @@ async def config_save(request: Request):
             errors.append("实盘非 dry-run 必须填写 funder 钱包")
         if not live.private_key_env:
             errors.append("实盘非 dry-run 必须填写私钥环境变量名")
+    return paper, run_cfg, live
+
+
+@app.post("/config")
+async def config_save_global(request: Request):
+    session = auth.current_session(request)
+    if session is None:
+        return RedirectResponse("/login?next=/config", status_code=302)
+    form = await request.form()
+    if not secrets.compare_digest(str(form.get("csrf") or ""), session.csrf):
+        raise HTTPException(status_code=400, detail="CSRF 校验失败，请刷新页面重试")
+    cfg = _load_cfg()
+    if cfg is None or not cfg.targets:
+        raise HTTPException(status_code=500, detail="无法读取当前配置")
+    errors: list[str] = []
+    paper, run_cfg, live = _parse_global_form(form, cfg, errors)
+
+    conn = queries.connect()
+    try:
+        active_pending = queries.active_pending_buys(conn)
+    finally:
+        queries.close(conn)
+    if active_pending and (run_cfg.mode != "live" or live.dry_run):
+        errors.append(
+            "存在未完成的实盘 maker 挂单，不能切换到 paper 或 dry-run；"
+            "请先在实盘处理完挂单")
+
+    new_cfg = AppConfig(
+        account=cfg.account, paper=paper, run=run_cfg, live=live,
+        targets=cfg.targets, path=cfg.path,
+    )
+    if errors:
+        return _render(
+            request, "config_global.html", "config", cfg=new_cfg,
+            run=run_cfg, live=live, pending_buys=active_pending,
+            csrf=session.csrf, saved=False, mode_changed=False,
+            error="；".join(errors), restart_requested=False,
+            restart_error=None, targets_changed=False, delete_error="",
+            config_path=str(queries.CONFIG_PATH),
+            db_path=str(queries.DB_PATH),
+        )
+    try:
+        config_io.save_config(new_cfg, queries.CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return _render(
+            request, "config_global.html", "config", cfg=new_cfg,
+            run=run_cfg, live=live, pending_buys=active_pending,
+            csrf=session.csrf, saved=False, mode_changed=False,
+            error=f"保存失败：{exc}", restart_requested=False,
+            restart_error=None, targets_changed=False, delete_error="",
+            config_path=str(queries.CONFIG_PATH),
+            db_path=str(queries.DB_PATH),
+        )
+    needs_restart = (run_cfg != cfg.run or live != cfg.live)
+    restart_requested = False
+    restart_error = None
+    if _fbool(form, "restart"):
+        restart_error = queries.request_restart()
+        restart_requested = restart_error is None
+    suffix = "&mode_changed=1" if needs_restart else ""
+    if restart_requested:
+        suffix += "&restart_requested=1"
+    if restart_error:
+        suffix += "&restart_error=" + urllib.parse.quote(str(restart_error))
+    return RedirectResponse(f"/config?saved=1{suffix}", status_code=303)
+
+
+@app.post("/config/target")
+async def config_save_target(request: Request):
+    session = auth.current_session(request)
+    if session is None:
+        return RedirectResponse("/login?next=/config", status_code=302)
+    form = await request.form()
+    if not secrets.compare_digest(str(form.get("csrf") or ""), session.csrf):
+        raise HTTPException(status_code=400, detail="CSRF 校验失败，请刷新页面重试")
+    cfg = _load_cfg()
+    if cfg is None or not cfg.targets:
+        raise HTTPException(status_code=500, detail="无法读取当前配置")
+    errors: list[str] = []
 
     target_key = str(form.get("target_key") or "").strip()
     is_new = target_key in ("", "__new__")
@@ -832,57 +907,40 @@ async def config_save(request: Request):
             break
 
     new_cfg = AppConfig(
-        account=cfg.account, paper=paper, run=run_cfg, live=live,
+        account=cfg.account, paper=cfg.paper, run=cfg.run, live=cfg.live,
         targets=targets, path=cfg.path,
     )
-
-    conn = queries.connect()
-    try:
-        active_pending = queries.active_pending_buys(conn)
-    finally:
-        queries.close(conn)
-    if active_pending and (mode != "live" or live.dry_run):
-        errors.append(
-            "存在未完成的实盘 maker 挂单，不能切换到 paper 或 dry-run；"
-            "请先在实盘处理完挂单")
-
     if errors:
         return _render(
-            request, "config.html", "config", cfg=new_cfg, target_name=name,
-            target_key=("__new__" if is_new else saved_key),
+            request, "config_target.html", "config", cfg=new_cfg,
+            target_name=name, target_key=("__new__" if is_new else saved_key),
             target=new_target, is_new=is_new, new_target_name=name,
-            csrf=session.csrf, saved=False,
-            mode_changed=False, error="；".join(errors),
-            restart_requested=False, restart_error=None,
-            targets_changed=False, delete_error="",
-            pending_buys=active_pending,
+            csrf=session.csrf, saved=False, mode_changed=False,
+            error="；".join(errors), restart_requested=False,
+            restart_error=None, targets_changed=False, delete_error="",
             config_path=str(queries.CONFIG_PATH),
-            db_path=str(queries.DB_PATH), run=run_cfg, live=live,
+            db_path=str(queries.DB_PATH),
         )
     try:
         config_io.save_config(new_cfg, queries.CONFIG_PATH)
     except Exception as exc:  # noqa: BLE001
         return _render(
-            request, "config.html", "config", cfg=new_cfg, target_name=name,
-            target_key=("__new__" if is_new else saved_key),
+            request, "config_target.html", "config", cfg=new_cfg,
+            target_name=name, target_key=("__new__" if is_new else saved_key),
             target=new_target, is_new=is_new, new_target_name=name,
-            csrf=session.csrf, saved=False,
-            mode_changed=False, error=f"保存失败：{exc}",
-            restart_requested=False, restart_error=None,
-            targets_changed=False, delete_error="",
-            pending_buys=active_pending,
+            csrf=session.csrf, saved=False, mode_changed=False,
+            error=f"保存失败：{exc}", restart_requested=False,
+            restart_error=None, targets_changed=False, delete_error="",
             config_path=str(queries.CONFIG_PATH),
-            db_path=str(queries.DB_PATH), run=run_cfg, live=live,
+            db_path=str(queries.DB_PATH),
         )
     targets_changed = _enabled_addresses(cfg) != _enabled_addresses(new_cfg)
-    needs_restart = (
-        run_cfg != cfg.run or live != cfg.live or targets_changed)
     restart_requested = False
     restart_error = None
     if _fbool(form, "restart") or targets_changed:
         restart_error = queries.request_restart()
         restart_requested = restart_error is None
-    suffix = "&mode_changed=1" if needs_restart else ""
+    suffix = ""
     if targets_changed:
         suffix += "&targets_changed=1"
     if restart_requested:
@@ -945,16 +1003,12 @@ def config_target_delete(request: Request, target_key: str = Form(""),
             status_code=303,
         )
     restart_error = queries.request_restart()
-    first = next(iter(targets))
     suffix = "&targets_changed=1"
     if restart_error is None:
         suffix += "&restart_requested=1"
     else:
         suffix += "&restart_error=" + urllib.parse.quote(str(restart_error))
-    return RedirectResponse(
-        f"/config?target={urllib.parse.quote(first)}{suffix}",
-        status_code=303,
-    )
+    return RedirectResponse(f"/config?saved=1{suffix}", status_code=303)
 
 
 # ---------------------------------------------------------------------------

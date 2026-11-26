@@ -1,0 +1,9 @@
+<div class="tabs">
+  <a href="/config" class="{{ 'active' if active == 'global' else '' }}">公共设置</a>
+  {% for name, t in cfg.targets.items() %}
+    <a href="/config?target={{ name }}" class="{{ 'active' if active == name else '' }}">
+      {{ name }} · {{ t.address|short_addr }}{% if not t.enabled %} · 停用{% endif %}
+    </a>
+  {% endfor %}
+  <a href="/config?target=__new__" class="{{ 'active' if active == '__new__' else '' }}">+ 新增地址</a>
+</div>

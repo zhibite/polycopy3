@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block title %}{{ '新增地址' if is_new else target_key }} · 策略配置 - PolyCopy{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>{{ '新增跟单地址' if is_new else '跟单地址：' ~ target_key }}</h1>
+    <div class="page-sub">以下参数只作用于该地址；公共参数请返回「公共设置」</div>
+  </div>
+  <div class="head-meta">
+    <a href="/config" class="market-link">← 公共设置</a><br>
+    配置文件：<span class="mono">{{ config_path }}</span>
+  </div>
+</div>
+
+{% include "_config_alerts.html" %}
+{% set active = target_key %}
+{% include "_config_tabs.html" %}
+
+<div class="alert info">
+  此页只修改 <b>{{ '新增地址' if is_new else target_key }}</b> 的跟单参数，不会影响其他地址。
+  已有地址保存后热加载；新增地址、启用/停用或删除地址会改变链上订阅列表，保存时自动请求重启 bot。
+</div>
+
+<form method="post" action="/config/target">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="target_key" value="{{ target_key }}">
+
+  <div class="config-group">
+    <h2><span class="dot"></span>地址信息</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>跟单地址名称{% if is_new %}（新地址）{% endif %}</label>
+        {% if is_new %}
+          <input type="text" name="new_target_name" value="{{ new_target_name|default('') }}"
+                 placeholder="例如 f705、alice" required>
+          <div class="help">只能包含字母、数字、_、-，长度 1–32；用作配置文件名。</div>
+        {% else %}
+          <input type="text" value="{{ target_key }}" readonly>
+          <div class="help">名称是 TOML 配置中的 key，不支持在此修改。</div>
+        {% endif %}
+      </div>
+      <div class="field">
+        <label>目标钱包地址</label>
+        {% if is_new %}
+          <input type="text" name="target.address" value="{{ target.address }}"
+                 placeholder="0x..." required>
+          <div class="help">填 Polymarket 代理钱包地址（data-api 的 proxy_wallet），不是签名 EOA。</div>
+        {% else %}
+          <input type="text" value="{{ target.address }}" readonly>
+          <div class="help">现有地址不可在此修改；如需更换请删除后新增。</div>
+        {% endif %}
+      </div>
+      <div class="field">
+        <label>启用该目标</label>
+        <div class="switch-row">
+          <input type="checkbox" name="target.enabled" value="1" {{ 'checked' if target.enabled else '' }}>
+          <span class="key">target.enabled</span>
+        </div>
+        <div class="help">关闭后不再跟新买入/跟卖；已有仓位仍会被止盈止损和强平逻辑管理。</div>
+      </div>
+      <div class="field">
+        <label>仓位模式</label>
+        <select name="target.sizing_mode">
+          <option value="scale" {{ 'selected' if target.sizing_mode == 'scale' else '' }}>按目标成交额比例</option>
+          <option value="fixed" {{ 'selected' if target.sizing_mode == 'fixed' else '' }}>每笔固定金额</option>
+        </select>
+        <div class="help">scale：我们的金额 = 目标金额 × 跟单比例；fixed：每笔固定金额。</div>
+      </div>
+      {% if not is_new and cfg.targets|length > 1 %}
+        <div class="field">
+          <label>删除该跟单地址</label>
+          <button class="btn btn-ghost btn-sm" type="submit"
+                  formaction="/config/target/delete" formnovalidate
+                  onclick="return confirm('删除该跟单地址？有未平仓仓位、挂单或待执行卖出时会被拒绝。')">
+            删除 {{ target_key }}
+          </button>
+          <div class="help">有未平仓仓位、未完成 maker 挂单、待执行卖出或实盘订单时不能删除。</div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>仓位与买入过滤</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>跟单比例（scale 模式）</label>
+        <input type="number" step="any" min="0.00001" max="1"
+               name="target.scale_factor" value="{{ target.scale_factor }}">
+        <div class="help">例如 0.02 表示目标买入 $100 时我们买入 $2。</div>
+      </div>
+      <div class="field">
+        <label>固定金额（fixed 模式，USD）</label>
+        <input type="number" step="any" min="0" name="target.fixed_notional_usd"
+               value="{{ target.fixed_notional_usd }}">
+      </div>
+      <div class="field">
+        <label>单笔最小金额（USD）</label>
+        <input type="number" step="any" min="0" name="target.min_notional_usd"
+               value="{{ target.min_notional_usd }}">
+      </div>
+      <div class="field">
+        <label>单笔最大金额（USD）</label>
+        <input type="number" step="any" min="0" name="target.max_notional_usd"
+               value="{{ target.max_notional_usd }}">
+      </div>
+      <div class="field">
+        <label>最低买入价（0–1）</label>
+        <input type="number" step="any" min="0" max="1" name="target.buy_price_min"
+               value="{{ target.buy_price_min }}">
+        <div class="help">只跟这个价格区间内的主动买入。</div>
+      </div>
+      <div class="field">
+        <label>最高买入价（0–1）</label>
+        <input type="number" step="any" min="0" max="1" name="target.buy_price_max"
+               value="{{ target.buy_price_max }}">
+      </div>
+      <div class="field">
+        <label>目标最小成交额（USD）</label>
+        <input type="number" step="1" min="0" name="target.min_target_usd"
+               value="{{ target.min_target_usd }}">
+        <div class="help">过滤目标钱包的小额碎单。</div>
+      </div>
+      <div class="field">
+        <label>目标最大成交额（USD）</label>
+        <input type="number" step="1" min="0" name="target.max_target_usd"
+               value="{{ target.max_target_usd }}">
+      </div>
+      <div class="field">
+        <label>单市场最大敞口（USD）</label>
+        <input type="number" step="1" min="0" name="target.max_market_usd"
+               value="{{ target.max_market_usd }}">
+        <div class="help">该跟单地址在同一 condition_id 下的持仓成本上限（含挂单中未成交部分）。</div>
+      </div>
+      <div class="field">
+        <label>最大同时持仓数</label>
+        <input type="number" step="1" min="1" max="10000" name="target.max_open_positions"
+               value="{{ target.max_open_positions }}">
+        <div class="help">该跟单地址的最大同时持仓数（含挂单中的 token）。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>到期过滤、实盘 Maker 与止盈止损</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>距结算最少小时数</label>
+        <input type="number" step="0.5" min="0" max="168"
+               name="target.min_hours_to_end" value="{{ target.min_hours_to_end }}">
+        <div class="help">0 = 不检查；例如 2 表示距市场结束不足 2 小时的目标买入不跟。无法获取结束时间时跳过。</div>
+      </div>
+      <div class="field">
+        <label>实盘 maker 挂单入场</label>
+        <div class="switch-row">
+          <input type="checkbox" name="target.maker_entry_enabled" value="1" {{ 'checked' if target.maker_entry_enabled else '' }}>
+          <span class="key">target.maker_entry_enabled</span>
+        </div>
+        <div class="help">仅实盘非 dry-run 生效：按目标成交价挂 GTC；纸盘仍直接 FAK 模拟。</div>
+      </div>
+      <div class="field">
+        <label>maker 挂单超时（秒）</label>
+        <input type="number" step="1" min="1" max="86400"
+               name="target.maker_timeout_seconds" value="{{ target.maker_timeout_seconds }}">
+        <div class="help">超时后撤单，未成交剩余用 FAK 补单。</div>
+      </div>
+      <div class="field">
+        <label>FAK 补单最高溢价（比例）</label>
+        <input type="number" step="any" min="0" max="0.5"
+               name="target.fak_max_premium_pct" value="{{ target.fak_max_premium_pct }}">
+        <div class="help">0.02 = 补单价格不超过目标价 × 1.02。</div>
+      </div>
+      <div class="field">
+        <label>止盈比例（相对入场均价）</label>
+        <input type="number" step="any" min="0" max="1"
+               name="target.take_profit_pct" value="{{ target.take_profit_pct }}">
+        <div class="help">0.10 = +10%；0 = 关闭。用中间价触发，触发后立即 strict FAK 卖出。</div>
+      </div>
+      <div class="field">
+        <label>止损比例（相对入场均价）</label>
+        <input type="number" step="any" min="0" max="1"
+               name="target.stop_loss_pct" value="{{ target.stop_loss_pct }}">
+        <div class="help">0.20 = −20%；0 = 关闭。目标尚未卖出时才由本规则退出。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>跟卖与过滤</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>跟随目标卖出</label>
+        <div class="switch-row">
+          <input type="checkbox" name="target.copy_sells" value="1" {{ 'checked' if target.copy_sells else '' }}>
+          <span class="key">target.copy_sells</span>
+        </div>
+        <div class="help">按目标卖出占其仓位的比例，卖出我们同比例的份额。</div>
+      </div>
+      <div class="field">
+        <label>首次回溯秒数</label>
+        <input type="number" step="1" min="0" max="86400" name="target.initial_lookback_seconds"
+               value="{{ target.initial_lookback_seconds }}">
+        <div class="help">仅首次启动时回溯最近 N 秒的成交。</div>
+      </div>
+      <div class="field">
+        <label>目标手续费率覆盖（留空继承全局）</label>
+        <input type="number" step="any" min="0" max="0.5" name="target.fee_rate"
+               value="{{ target.fee_rate if target.fee_rate is not none else '' }}"
+               placeholder="继承 paper.fee_rate">
+        <div class="help">留空继承公共手续费率；按市场的 feeSchedule 设置。</div>
+      </div>
+      <div class="field">
+        <label>排除事件关键词（逗号分隔）</label>
+        <input type="text" name="target.exclude_event_substrings"
+               value="{{ target.exclude_event_substrings|join(', ') }}"
+               placeholder="-updown-">
+        <div class="help">event_slug 包含任一关键词时跳过。</div>
+      </div>
+      <div class="field">
+        <label>排除市场关键词（逗号分隔）</label>
+        <input type="text" name="target.exclude_slug_substrings"
+               value="{{ target.exclude_slug_substrings|join(', ') }}">
+        <div class="help">market slug 包含任一关键词时跳过。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="save-bar">
+    <span class="save-msg">
+      只保存该地址的参数 · 保存后热加载 · 新增/启用/停用地址会自动请求重启
+      · 修改前自动备份 .bak
+    </span>
+    <a href="/config" class="btn btn-ghost" style="text-decoration:none;display:inline-block;padding:9px 16px;border-radius:7px">返回公共设置</a>
+    <button class="btn btn-ghost" type="submit" name="restart" value="1">保存并重启 bot</button>
+    <button class="btn btn-primary" type="submit">保存该地址参数</button>
+  </div>
+</form>
+
+{% endblock %}

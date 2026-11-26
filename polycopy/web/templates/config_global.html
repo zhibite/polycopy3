@@ -1,0 +1,317 @@
+{% extends "base.html" %}
+{% block title %}策略配置 · 公共设置 - PolyCopy{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>策略配置 · 公共设置</h1>
+    <div class="page-sub">公共参数作用于所有跟单地址；每个地址的跟单参数在下方列表里逐个编辑</div>
+  </div>
+  <div class="head-meta">
+    配置文件：<span class="mono">{{ config_path }}</span><br>
+    数据库：<span class="mono">{{ db_path }}</span>
+  </div>
+</div>
+
+{% include "_config_alerts.html" %}
+{% set active = 'global' %}
+{% include "_config_tabs.html" %}
+
+<div class="alert info">
+  这里只维护<b>所有地址共用</b>的公共参数：运行模式、实盘安全设置、轮询与成交模拟。
+  每个地址的价格带、目标最小成交额、固定金额、距结算时间、maker、止盈止损、跟卖和排除词，
+  请在下方「跟单地址」里点「编辑」单独设置。
+  公共参数保存后热加载；运行模式 / live 设置变更需要重启；地址列表变更在地址页保存时会自动请求重启。
+</div>
+
+<div class="config-group">
+  <h2><span class="dot"></span>跟单地址 <span class="count">{{ cfg.targets|length }}</span>
+    <a class="more" href="/config?target=__new__">+ 新增地址</a>
+  </h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>名称</th><th>地址</th><th>状态</th><th>仓位</th><th>价格带</th>
+          <th>目标最小</th><th>距结算</th><th>maker</th><th>TP/SL</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for name, t in cfg.targets.items() %}
+          <tr>
+            <td><b>{{ name }}</b></td>
+            <td class="mono">
+              <a class="market-link" href="https://polymarket.com/profile/{{ t.address }}"
+                 target="_blank" rel="noopener noreferrer" title="{{ t.address }}">{{ t.address|short_addr }}</a>
+            </td>
+            <td>
+              {% if t.enabled %}
+                <span class="pill ok">启用</span>
+              {% else %}
+                <span class="pill idle">停用</span>
+              {% endif %}
+            </td>
+            <td class="mono">
+              {{ '固定 $%.0f'|format(t.fixed_notional_usd) if t.sizing_mode == 'fixed'
+                 else '跟单 ' ~ (t.scale_factor * 100)|round(2) ~ '%' }}
+            </td>
+            <td class="mono">{{ '%.2f'|format(t.buy_price_min) }}–{{ '%.2f'|format(t.buy_price_max) }}</td>
+            <td class="mono">{{ t.min_target_usd|money }}</td>
+            <td class="mono">{{ t.min_hours_to_end }}h</td>
+            <td>{{ '开' if t.maker_entry_enabled else '关' }}</td>
+            <td>
+              {% if t.take_profit_pct or t.stop_loss_pct %}
+                +{{ (t.take_profit_pct * 100)|round(0)|int }}% / -{{ (t.stop_loss_pct * 100)|round(0)|int }}%
+              {% else %}
+                关闭
+              {% endif %}
+            </td>
+            <td><a class="market-link" href="/config?target={{ name }}">编辑 →</a></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="no-data">还没有跟单地址</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<form method="post" action="/config">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+
+  <div class="config-group">
+    <h2><span class="dot"></span>账户</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>账户初始资金</label>
+        <input type="text" value="{{ cfg.account.starting_cash|money }}" readonly>
+        <div class="help">建库时写入；所有跟单地址共用一个账户。</div>
+      </div>
+      <div class="field">
+        <label>跟单地址数</label>
+        <input type="text" value="{{ cfg.targets|length }}" readonly>
+        <div class="help">在「跟单地址」列表里新增或编辑。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>运行模式</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>执行模式</label>
+        <select name="run.mode">
+          <option value="paper" {{ 'selected' if run.mode == 'paper' else '' }}>纸盘 paper（默认）</option>
+          <option value="live" {{ 'selected' if run.mode == 'live' else '' }}>实盘 live</option>
+        </select>
+        <div class="help">纸盘只用内部账本模拟成交；实盘通过 CLOB 提交订单。</div>
+      </div>
+      <div class="field">
+        <label>实盘 dry-run</label>
+        <div class="switch-row">
+          <input type="checkbox" name="live.dry_run" value="1" {{ 'checked' if live.dry_run else '' }}>
+          <span class="key">live.dry_run</span>
+        </div>
+        <div class="help">开启时只记录订单意图和风控结果，不向交易所提交。首次接实盘必须保持开启。</div>
+      </div>
+      <div class="field">
+        <label>当前生效状态</label>
+        <input type="text" value="{{ run_mode }}{% if run_mode == 'live' %}{{ ' · DRY RUN' if live_dry_run else ' · 会真实下单' }}{% endif %}{% if mode_mismatch %}（配置已改为 {{ run.mode }}，待重启）{% endif %}" readonly>
+        <div class="help">显示 bot 进程实际使用的模式；配置文件中的模式以重启后为准。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>实盘安全设置</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>私钥环境变量名</label>
+        <input type="text" name="live.private_key_env" value="{{ live.private_key_env }}"
+               placeholder="POLY_PRIVATE_KEY">
+        <div class="help">只填变量名，私钥本身放 VPS 的 .env，绝不写进配置文件或此页面。</div>
+      </div>
+      <div class="field">
+        <label>Funder / 代理钱包</label>
+        <input type="text" name="live.funder" value="{{ live.funder }}"
+               placeholder="0x...">
+        <div class="help">实际持有 USDC/仓位、用于下单归因的代理钱包地址。</div>
+      </div>
+      <div class="field">
+        <label>签名类型</label>
+        <select name="live.signature_type">
+          <option value="0" {{ 'selected' if live.signature_type == 0 else '' }}>0 · EOA / 私钥钱包</option>
+          <option value="1" {{ 'selected' if live.signature_type == 1 else '' }}>1 · Email / Magic 代理</option>
+          <option value="2" {{ 'selected' if live.signature_type == 2 else '' }}>2 · 旧版浏览器钱包 / Safe 代理</option>
+          <option value="3" {{ 'selected' if live.signature_type == 3 else '' }}>3 · Deposit Wallet / POLY_1271（2026 新账户）</option>
+        </select>
+        <div class="help">OKX/MetaMask 等插件登录后，如果 Polymarket 显示的是“deposit address”，通常用 3，funder 填该 deposit 地址；旧版 Safe 代理用 2；新建 EOA 热钱包用 0。</div>
+      </div>
+      <div class="field">
+        <label>实盘数据库路径</label>
+        <input type="text" name="live.db_path" value="{{ live.db_path }}">
+        <div class="help">必须与纸盘库分开；切换模式后重启会使用这个库。</div>
+      </div>
+      <div class="field">
+        <label>实盘日志路径</label>
+        <input type="text" name="live.log_path" value="{{ live.log_path }}">
+      </div>
+      <div class="field">
+        <label>实盘单笔上限（USD）</label>
+        <input type="number" step="any" min="0.01" name="live.max_order_usd"
+               value="{{ live.max_order_usd }}">
+        <div class="help">在此之上仍受每个跟单地址的单笔最大金额约束。</div>
+      </div>
+      <div class="field">
+        <label>实盘总敞口上限（USD）</label>
+        <input type="number" step="any" min="0" name="live.max_total_exposure_usd"
+               value="{{ live.max_total_exposure_usd }}">
+        <div class="help">所有地址合计的持仓成本上限，超过后停止新的买入。</div>
+      </div>
+      <div class="field">
+        <label>实盘日亏损上限（USD）</label>
+        <input type="number" step="any" min="0" name="live.max_daily_loss_usd"
+               value="{{ live.max_daily_loss_usd }}">
+        <div class="help">UTC 当日已实现亏损达到该值后停止买入；卖出不受影响。</div>
+      </div>
+      <div class="field">
+        <label>最小下单份额</label>
+        <input type="number" step="any" min="0" name="live.min_order_shares"
+               value="{{ live.min_order_shares }}">
+        <div class="help">Polymarket CLOB 常见最小单为 5 股；低于该值的信号跳过。</div>
+      </div>
+      <div class="field">
+        <label>盘口深度占比上限</label>
+        <input type="number" step="any" min="0" max="1" name="live.max_book_depth_pct"
+               value="{{ live.max_book_depth_pct }}">
+        <div class="help">单笔最多吃掉可见盘口深度的比例，防止大单冲击薄市场。</div>
+      </div>
+      <div class="field">
+        <label>订单等待超时（秒）</label>
+        <input type="number" step="1" min="1" max="3600" name="live.order_timeout_seconds"
+               value="{{ live.order_timeout_seconds }}">
+        <div class="help">FAK 订单查询终态的最长时间；超时后由对账流程处理。</div>
+      </div>
+      <div class="field">
+        <label>Kill switch 文件路径</label>
+        <input type="text" name="live.kill_switch_path" value="{{ live.kill_switch_path }}">
+        <div class="help">该文件存在时停止新的实盘买入并撤销未完成 maker 挂单；卖出仍允许。</div>
+      </div>
+      <div class="field">
+        <label>自动赎回</label>
+        <div class="switch-row">
+          <input type="checkbox" name="live.redeem" value="1" {{ 'checked' if live.redeem else '' }}>
+          <span class="key">live.redeem</span>
+        </div>
+        <div class="help">市场结算后尝试通过 SDK 赎回；失败则保留为可领取。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="config-group">
+    <h2><span class="dot"></span>轮询与成交模拟</h2>
+    <div class="config-grid">
+      <div class="field">
+        <label>轮询间隔（秒）</label>
+        <input type="number" step="1" min="2" max="3600" name="paper.poll_seconds"
+               value="{{ cfg.paper.poll_seconds }}">
+        <div class="help">默认 5 秒；实际延迟还受数据源聚合影响。</div>
+      </div>
+      <div class="field">
+        <label>回溯重叠窗口（秒）</label>
+        <input type="number" step="1" min="0" max="86400" name="paper.overlap_seconds"
+               value="{{ cfg.paper.overlap_seconds }}">
+        <div class="help">每次轮询向前多取一段，靠去重避免重复跟进。</div>
+      </div>
+      <div class="field">
+        <label>信号有效期（秒）</label>
+        <input type="number" step="1" min="0" max="604800" name="paper.stale_signal_seconds"
+               value="{{ cfg.paper.stale_signal_seconds }}">
+        <div class="help">超过这个时间的成交信号不再跟单。</div>
+      </div>
+      <div class="field">
+        <label>全局手续费率</label>
+        <input type="number" step="any" min="0" max="0.5" name="paper.fee_rate"
+               value="{{ cfg.paper.fee_rate }}">
+        <div class="help">手续费 = 份额 × 费率 × 价格 × (1 − 价格)。单个地址可在地址页覆盖。</div>
+      </div>
+      <div class="field">
+        <label>买入滑点上限（价格）</label>
+        <input type="number" step="any" min="0" max="0.5" name="paper.max_buy_drift"
+               value="{{ cfg.paper.max_buy_drift }}">
+        <div class="help">成交 VWAP 高于信号价超过该值就放弃。</div>
+      </div>
+      <div class="field">
+        <label>卖出滑点上限（价格）</label>
+        <input type="number" step="any" min="0" max="0.5" name="paper.max_sell_drift"
+               value="{{ cfg.paper.max_sell_drift }}">
+      </div>
+      <div class="field">
+        <label>买入相对滑点上限（比例）</label>
+        <input type="number" step="any" min="0" max="1" name="paper.max_buy_drift_pct"
+               value="{{ cfg.paper.max_buy_drift_pct }}">
+        <div class="help">与绝对滑点取较小值，防止 0.003 这类低价 token 在 0.01+ 成交。</div>
+      </div>
+      <div class="field">
+        <label>卖出相对滑点上限（比例）</label>
+        <input type="number" step="any" min="0" max="1" name="paper.max_sell_drift_pct"
+               value="{{ cfg.paper.max_sell_drift_pct }}">
+      </div>
+      <div class="field">
+        <label>最低成交比例</label>
+        <input type="number" step="any" min="0" max="1" name="paper.min_fill_ratio"
+               value="{{ cfg.paper.min_fill_ratio }}">
+        <div class="help">盘口只能吃到部分数量时，低于该比例就整笔放弃。</div>
+      </div>
+      <div class="field">
+        <label>现金保留比例</label>
+        <input type="number" step="any" min="0" max="0.9" name="paper.cash_reserve_pct"
+               value="{{ cfg.paper.cash_reserve_pct }}">
+      </div>
+      <div class="field">
+        <label>结算检查间隔（秒）</label>
+        <input type="number" step="1" min="30" max="86400" name="paper.settle_every_seconds"
+               value="{{ cfg.paper.settle_every_seconds }}">
+      </div>
+      <div class="field">
+        <label>标记价格间隔（秒）</label>
+        <input type="number" step="1" min="30" max="86400" name="paper.mark_every_seconds"
+               value="{{ cfg.paper.mark_every_seconds }}">
+      </div>
+      <div class="field">
+        <label>止盈止损检查间隔（秒）</label>
+        <input type="number" step="1" min="5" max="86400" name="paper.risk_check_seconds"
+               value="{{ cfg.paper.risk_check_seconds }}">
+        <div class="help">批量取中间价检查所有开启止盈止损的持仓；建议 15–60 秒。</div>
+      </div>
+      <div class="field">
+        <label>新仓位保护期（秒）</label>
+        <input type="number" step="any" min="0" max="3600" name="paper.orphan_grace_seconds"
+               value="{{ cfg.paper.orphan_grace_seconds }}">
+        <div class="help">刚买入的仓位在该时间内不被「目标已清仓」强平；0 = 关闭。</div>
+      </div>
+      <div class="field">
+        <label>活动接口最大分页数</label>
+        <input type="number" step="1" min="1" max="50" name="paper.max_pages"
+               value="{{ cfg.paper.max_pages }}">
+      </div>
+      <div class="field">
+        <label>活动接口每页条数</label>
+        <input type="number" step="1" min="50" max="1000" name="paper.page_limit"
+               value="{{ cfg.paper.page_limit }}">
+      </div>
+    </div>
+  </div>
+
+  <div class="save-bar">
+    <span class="save-msg">
+      公共参数热加载 · 运行模式 / live 设置变更需重启 · 修改前自动备份 .bak
+      · 「保存并重启」会短暂中断监控
+    </span>
+    <a href="/config" class="btn btn-ghost" style="text-decoration:none;display:inline-block;padding:9px 16px;border-radius:7px">放弃修改</a>
+    <button class="btn btn-ghost" type="submit" name="restart" value="1">保存并重启 bot</button>
+    <button class="btn btn-primary" type="submit">保存公共参数</button>
+  </div>
+</form>
+
+{% endblock %}

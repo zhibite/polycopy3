@@ -1,0 +1,29 @@
+{% if saved %}
+  {% if restart_error %}
+    <div class="alert warn">配置已保存，但重启请求提交失败：{{ restart_error }}</div>
+  {% elif restart_requested %}
+    <div class="alert ok">配置已保存。重启请求已提交，bot 将在几秒内重启并加载新配置。</div>
+  {% elif mode_changed %}
+    <div class="alert warn">配置已保存。运行模式或实盘设置已变更，需要重启 bot 才会生效；重启前仍按旧配置运行。</div>
+  {% else %}
+    <div class="alert ok">配置已保存。策略参数将在约 {{ cfg.paper.poll_seconds }} 秒内自动生效。</div>
+  {% endif %}
+{% endif %}
+{% if targets_changed %}
+  <div class="alert warn">
+    跟单地址列表已变化：链上订阅在 bot 启动时固定，新增/删除/停用地址需要重启后才会生效。
+    重启请求会在保存时自动提交；如果没有生效，请到「公共设置」点「保存并重启 bot」。
+  </div>
+{% endif %}
+{% if delete_error %}
+  <div class="alert warn">删除失败：{{ delete_error }}</div>
+{% endif %}
+{% if error %}
+  <div class="alert warn">保存失败：{{ error }}</div>
+{% endif %}
+{% if pending_buys %}
+  <div class="alert warn">
+    当前有 <b>{{ pending_buys|length }}</b> 个未完成的实盘 maker 挂单。
+    切换 paper / dry-run 前请先在实盘处理完这些挂单，否则新进程无法撤单。
+  </div>
+{% endif %}
