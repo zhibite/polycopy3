@@ -54,27 +54,28 @@ db_path = "data/paper_f705.db"
 log_path = "data/paper_f705.log"
 
 # f705 — 30–70c core bucket.
-# 2026-11-26: fixed $10 per copied buy; only target buys >= $1000 with at
-# least 2h to settlement. Live entry uses a maker GTC at the target price,
+# 2026-11-27: paper focus is paddaa; f705 disabled (no new entries).
+# 2026-11-26: scale 5% per copied buy (cap $300); only target buys >= $20 with at
+# least 1h to settlement. Live entry uses a maker GTC at the target price,
 # then a FAK tail capped at +2% after 5 minutes. TP/SL exits when the target
 # has not sold.
 [targets.f705]
 address = "0xf705fa045201391d9632b7f3cde06a5e24453ca7"
-enabled = true
-sizing_mode = "fixed"
+enabled = false
+sizing_mode = "scale"
 scale_factor = 0.05
 fixed_notional_usd = 10.0
 min_notional_usd = 2.0
-max_notional_usd = 500.0
-buy_price_min = 0.30
+max_notional_usd = 300.0
+buy_price_min = 0.01
 buy_price_max = 0.70
-min_target_usd = 1000.0
+min_target_usd = 20.0
 max_target_usd = 1000000000000.0
 copy_sells = true
 initial_lookback_seconds = 300
 max_market_usd = 500.0
 max_open_positions = 300
-min_hours_to_end = 2.0
+min_hours_to_end = 1.0
 maker_entry_enabled = true
 maker_timeout_seconds = 300
 fak_max_premium_pct = 0.02
@@ -85,28 +86,28 @@ exclude_slug_substrings = []
 
 # paddaa — 0x60a92c...: 30–70c event markets (geopolitics/politics/AI),
 # 73% maker, median hold ~10 days, sells often. Added 2026-11-26 for the
-# multi-target paper test with the same strategy parameters as f705.
+# multi-target paper test. 2026-11-27: exits = follow target sells + TP10, no stop loss.
 [targets.paddaa]
 address = "0x60a92c8620846d81f5ea17b0564e0d4b7c545a71"
 enabled = true
-sizing_mode = "fixed"
+sizing_mode = "scale"
 scale_factor = 0.05
 fixed_notional_usd = 10.0
 min_notional_usd = 2.0
-max_notional_usd = 500.0
-buy_price_min = 0.30
+max_notional_usd = 300.0
+buy_price_min = 0.01
 buy_price_max = 0.70
-min_target_usd = 1000.0
+min_target_usd = 20.0
 max_target_usd = 1000000000000.0
 copy_sells = true
 initial_lookback_seconds = 300
 max_market_usd = 500.0
 max_open_positions = 300
-min_hours_to_end = 2.0
+min_hours_to_end = 1.0
 maker_entry_enabled = true
 maker_timeout_seconds = 300
 fak_max_premium_pct = 0.02
 take_profit_pct = 0.10
-stop_loss_pct = 0.20
+stop_loss_pct = 0.0
 exclude_event_substrings = []
 exclude_slug_substrings = []
